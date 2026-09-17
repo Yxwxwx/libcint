@@ -310,3 +310,8 @@ endif()
 set(CPACK_COMPONENTS_GROUPING "IGNORE")
 
 include(CPack)
+
+option(WITH_GPW "Build the isolated complex GPW integral library" OFF)
+if(WITH_GPW)
+  add_subdirectory(src/gpw)
+endif()
