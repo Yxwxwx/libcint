@@ -1,4 +1,25 @@
-"""ctypes declarations matching libcint/include/gpw.h (ABI 1)."""
+"""NumPy/PySCF bindings for the mixed GTO–plane-wave integrals in libgpw.
+
+Coordinates are in bohr, wavevectors in bohr^-1, and P_k(r) = exp(+i k·r).
+All integral results are complex128. Passing one wavevector of shape (3,)
+returns no batch axis; passing (nk, 3) adds one leading batch axis. For
+gppg, that axis counts (k[i], kp[i]) pairs, not independent k and kp axes.
+The remaining axes always count Gaussian AOs: three for gpgg, two for gppg,
+and one for each one-electron integral.
+
+Common keyword arguments for the five integral functions:
+    shls: Zero-based GTO shell indices, one per Gaussian AO axis. Omit to
+        return all AO combinations.
+    cart: Use Cartesian AOs if true, real spherical AOs if false; None uses
+        mol.cart.
+    pw_norm: 'bare' (default), 'delta3', 'box', or 'legacy_k'. The factor is
+        applied once per plane wave, so gppg receives two factors.
+    volume: Positive box volume in bohr^3, required only for pw_norm='box'.
+    opt: An open GPW Prepared cache from prepare(mol), or None.
+
+The bindings match libcint/include/gpw.h, ABI 1. The second plane wave in
+gppg is conjugated internally; pass its actual wavevector.
+"""
 import ctypes as ct
 from functools import lru_cache
 import os
@@ -16,6 +37,19 @@ _env_args = [PInt, ct.c_int32, PInt, ct.c_int32, PDouble, ct.c_size_t]
 
 @lru_cache(maxsize=1)
 def library():
+    """Load and cache the ABI-1 libgpw shared library and C signatures.
+
+    GPW_LIBRARY, if set before the first call, must be an absolute path.
+    Otherwise the source-tree build and then the system library are tried.
+
+    Returns:
+        A ctypes CDLL with GPW function signatures configured.
+
+    Raises:
+        ValueError: GPW_LIBRARY is a relative path.
+        OSError: The shared library cannot be loaded.
+        ImportError: The library has an incompatible ABI.
+    """
     path = os.environ.get('GPW_LIBRARY')
     if path is not None and not Path(path).is_absolute():
         raise ValueError('GPW_LIBRARY must be an absolute path')
@@ -61,14 +95,30 @@ def library():
 
 
 def double_pointer(array):
+    """Return a ctypes double pointer to an array, or NULL for None."""
     return None if array is None else array.ctypes.data_as(PDouble)
 
 
 def int_pointer(array):
+    """Return a ctypes int32 pointer to an array's existing data."""
     return array.ctypes.data_as(PInt)
 
 
 def inputs(atm, bas, env):
+    """Convert PySCF molecule arrays to contiguous GPW ABI inputs.
+
+    Args:
+        atm: Atom table with shape (natm, 6) and integer entries.
+        bas: Shell table with shape (nbas, 8) and integer entries.
+        env: One-dimensional real-valued environment array.
+
+    Returns:
+        A pair ``(arrays, c_args)``. Keep ``arrays`` alive while passing
+        ``c_args`` to C; it owns the buffers referenced by the pointers.
+
+    Raises:
+        ValueError: An array has an invalid shape, type, or int32 range.
+    """
     for value, cols in [(atm, 6), (bas, 8)]:
         if value.ndim != 2 or value.shape[1] != cols or value.dtype.kind not in 'iu':
             raise ValueError('invalid atm/bas shape or integer dtype')
@@ -86,14 +136,16 @@ def inputs(atm, bas, env):
 
 
 def check(status, context):
+    """Raise RuntimeError with context for a negative GPW status code."""
     if status < 0:
         message = library().gpw_error_string(status).decode()
         raise RuntimeError(f'GPW {message}; {context}')
 
 
 class Prepared:
-    """Immutable GPWOpt; share between threads, close only after calls finish."""
+    """Immutable GPW-specific cache; share only while it remains open."""
     def __init__(self, mol):
+        """Create a cache from the current PySCF molecule arrays."""
         arrays, args = inputs(mol._atm, mol._bas, mol._env)
         lib = library()
         handle = Handle()
@@ -102,24 +154,43 @@ class Prepared:
         self._finalizer = weakref.finalize(self, lib.gpw_opt_destroy, handle)
 
     def close(self):
+        """Release the native cache; repeated calls are harmless."""
         self._finalizer()
         self._handle = None
 
     def __enter__(self):
+        """Return this open cache for use in a ``with`` statement."""
         if self._handle is None:
             raise ValueError('prepared object is closed')
         return self
 
     def __exit__(self, *exc):
+        """Close the cache on context exit without suppressing exceptions."""
         self.close()
 
 
 def prepare(mol):
-    """Snapshot atm/bas/env for opt= calls. Changed inputs raise an error."""
+    """Create a reusable GPW cache from a PySCF molecule.
+
+    Args:
+        mol: PySCF Mole providing ``_atm``, ``_bas``, and ``_env``.
+
+    Returns:
+        A context-managed Prepared object for ``opt=`` calls. GPW rejects
+        later changes to the molecule arrays; this is not libcint's CINTOpt.
+    """
     return Prepared(mol)
 
 
 def _waves(k):
+    """Return contiguous real ``(nk, 3)`` wavevectors and a single-input flag.
+
+    Args:
+        k: One wavevector ``(3,)`` or a batch ``(nk, 3)`` in bohr^-1.
+
+    Raises:
+        ValueError: The wavevectors are complex, nonfinite, or mis-shaped.
+    """
     k = np.asarray(k)
     if np.iscomplexobj(k):
         raise ValueError('wavevectors must be real')
@@ -133,6 +204,14 @@ def _waves(k):
 
 
 def _normalization(k, pw_norm, volume):
+    """Return one real normalization factor per wavevector in ``k``.
+
+    ``bare`` gives 1, ``delta3`` gives (2π)^(-3/2), ``box`` gives
+    volume^(-1/2), and ``legacy_k`` gives (2π)^(-3/2)|k|.
+
+    Raises:
+        ValueError: The mode is unknown or box volume is not positive finite.
+    """
     if pw_norm == 'bare':
         return np.ones(len(k))
     if pw_norm == 'delta3':
@@ -148,6 +227,21 @@ def _normalization(k, pw_norm, volume):
 
 def _evaluate(kind, mol, k, kp=None, *, shls=None, cart=None,
               pw_norm='bare', volume=None, opt=None):
+    """Evaluate one integral kind and assemble its AO shell blocks.
+
+    ``kind`` is ovlp, kin, nuc, gpgg, or gppg. For gppg, ``k`` and ``kp``
+    must have identical shapes and are paired by position. ``shls`` selects
+    one shell per AO axis; other options follow the module conventions.
+
+    Returns:
+        A complex128 AO array, with a leading batch axis only for batched
+        wavevectors. The number of AO axes is one, three, or two for the
+        one-electron, gpgg, and gppg integrals, respectively.
+
+    Raises:
+        ValueError: Invalid options, wavevectors, shells, or unsupported ECP.
+        RuntimeError: The native GPW call fails or ``opt`` is stale.
+    """
     rank = 3 if kind == 'gpgg' else 2 if kind == 'gppg' else 1
     waves, single = _waves(k)
     other = None
@@ -205,45 +299,150 @@ def _evaluate(kind, mol, k, kp=None, *, shls=None, cart=None,
 
 
 def ovlp(mol, k, **kwargs):
-    """<G|P>: (nao,) or (nk,nao); options: shls, cart, pw_norm, volume, opt."""
+    """Compute the Gaussian–plane-wave overlap ``<G_a|P_k>``.
+
+    Args:
+        mol: PySCF Mole containing the Gaussian AO basis.
+        k: One real wavevector ``(3,)`` or a batch ``(nk, 3)`` in bohr^-1.
+        **kwargs: Common ``shls``, ``cart``, ``pw_norm``, ``volume``, and
+            ``opt`` options documented at module level.
+
+    Returns:
+        Complex AO overlaps with shape ``(nao,)`` or ``(nk, nao)``. If
+        ``shls`` is given, ``nao`` is the selected shell's AO count.
+    """
     return _evaluate('ovlp', mol, k, **kwargs)
 
 
 def kin(mol, k, **kwargs):
-    """<G|-laplacian/2|P>, with the operator acting on exp(+i k.r)."""
+    """Compute ``<G_a|-∇²/2|P_k>`` with the operator acting on ``P_k``.
+
+    Args:
+        mol: PySCF Mole containing the Gaussian AO basis.
+        k: One real wavevector ``(3,)`` or a batch ``(nk, 3)`` in bohr^-1.
+        **kwargs: Common options documented at module level.
+
+    Returns:
+        Complex array shaped like :func:`ovlp`. Each element equals its
+        overlap counterpart times ``|k|²/2``.
+    """
     return _evaluate('kin', mol, k, **kwargs)
 
 
 def nuc(mol, k, **kwargs):
-    """<G|-sum_A Z_A/r_A|P>, including finite Gaussian/fractional nuclei."""
+    """Compute ``<G_a|V_nuc|P_k>`` for the molecule's nuclei.
+
+    Point, Gaussian-charge, and fractional-charge nuclei are supported;
+    ECP contributions are not included.
+
+    Args:
+        mol: PySCF Mole containing the Gaussian AO basis and nuclei.
+        k: One real wavevector ``(3,)`` or a batch ``(nk, 3)`` in bohr^-1.
+        **kwargs: Common options documented at module level.
+
+    Returns:
+        Complex array shaped like :func:`ovlp`.
+
+    Raises:
+        ValueError: The molecule contains ECP shells.
+    """
     return _evaluate('nuc', mol, k, **kwargs)
 
 
 def gpgg(mol, k, **kwargs):
-    """Chemists' (G_a P_k|G_b G_c): (nao,nao,nao) or (nk,nao,nao,nao)."""
+    """Compute the chemists' two-electron integral ``(G_a P_k|G_b G_c)``.
+
+    Args:
+        mol: PySCF Mole containing the Gaussian AO basis.
+        k: One real wavevector ``(3,)`` or a batch ``(nk, 3)`` in bohr^-1.
+        **kwargs: Common options documented at module level; ``shls``
+            selects three Gaussian shells in ``(a, b, c)`` order.
+
+    Returns:
+        Complex array ``(nao, nao, nao)`` or ``(nk, nao, nao, nao)``.
+        The three AO axes index ``(a, b, c)``; the leading axis, if present,
+        indexes ``k[i]``. Shell selection replaces each ``nao`` with that
+        shell's AO count.
+    """
     return _evaluate('gpgg', mol, k, **kwargs)
 
 
 def gppg(mol, k, kp, **kwargs):
-    """Chemists' (G_a P_k|P_kp G_b): (nao,nao) or (nk,nao,nao); zip pairs."""
+    """Compute the chemists' integral ``(G_a P_k|P_kp G_b)``.
+
+    The second plane wave is conjugated internally. Batched wavevectors are
+    paired by position: result ``[i, a, b]`` is
+    ``(G_a P_{k[i]}|P_{kp[i]} G_b)``. There is one batch axis for the pairs,
+    not one axis per plane wave; no Cartesian product is made.
+
+    Args:
+        mol: PySCF Mole containing the Gaussian AO basis.
+        k: One real wavevector ``(3,)`` or a batch ``(nk, 3)`` in bohr^-1.
+        kp: Actual wavevector(s) for the second plane wave, with exactly the
+            same shape as ``k``.
+        **kwargs: Common options documented at module level; ``shls``
+            selects two Gaussian shells in ``(a, b)`` order.
+
+    Returns:
+        Complex array ``(nao, nao)`` for two single ``(3,)`` inputs, or
+        ``(nk, nao, nao)`` for two ``(nk, 3)`` inputs. The AO axes index
+        ``(a, b)``. Shell selection replaces each ``nao`` with that shell's
+        AO count.
+
+    Example:
+        If ``k.shape == kp.shape == (2, 3)`` and ``nao == 7``, then
+        ``gppg(mol, k, kp).shape == (2, 7, 7)``: only pairs ``(k[0], kp[0])``
+        and ``(k[1], kp[1])`` are computed. By contrast,
+        ``gppg(mol, k[0], k[1]).shape == (7, 7)``. To get all four cross
+        pairs with shape ``(2, 2, 7, 7)``::
+
+            ki = np.repeat(k, len(kp), axis=0)
+            kj = np.tile(kp, (len(k), 1))
+            all_pairs = gppg(mol, ki, kj).reshape(len(k), len(kp), nao, nao)
+    """
     return _evaluate('gppg', mol, k, kp, **kwargs)
 
 
 def ovlp_by_shell(mol, shls, k, **kwargs):
+    """Compute ``<G_a|P_k>`` for the one zero-based GTO shell in ``shls``.
+
+    Returns a complex array ``(n_a,)`` or ``(nk, n_a)``; see :func:`ovlp`
+    for ``mol``, ``k``, and the remaining keyword options.
+    """
     return ovlp(mol, k, shls=shls, **kwargs)
 
 
 def kin_by_shell(mol, shls, k, **kwargs):
+    """Compute ``<G_a|-∇²/2|P_k>`` for the shell in ``shls``.
+
+    Returns a complex array ``(n_a,)`` or ``(nk, n_a)``; see :func:`kin`
+    for ``mol``, ``k``, and the remaining keyword options.
+    """
     return kin(mol, k, shls=shls, **kwargs)
 
 
 def nuc_by_shell(mol, shls, k, **kwargs):
+    """Compute ``<G_a|V_nuc|P_k>`` for the shell in ``shls``.
+
+    Returns a complex array ``(n_a,)`` or ``(nk, n_a)``; see :func:`nuc`
+    for ``mol``, ``k``, and the remaining keyword options.
+    """
     return nuc(mol, k, shls=shls, **kwargs)
 
 
 def gpgg_by_shell(mol, shls, k, **kwargs):
+    """Compute ``(G_a P_k|G_b G_c)`` for ``shls=(a, b, c)``.
+
+    Returns ``(n_a, n_b, n_c)`` or ``(nk, n_a, n_b, n_c)``; see
+    :func:`gpgg` for ``mol``, ``k``, and the remaining keyword options.
+    """
     return gpgg(mol, k, shls=shls, **kwargs)
 
 
 def gppg_by_shell(mol, shls, k, kp, **kwargs):
+    """Compute ``(G_a P_k|P_kp G_b)`` for ``shls=(a, b)``.
+
+    Returns ``(n_a, n_b)`` or ``(nk, n_a, n_b)``; see :func:`gppg` for
+    ``mol``, ``k``, ``kp``, and the remaining keyword options.
+    """
     return gppg(mol, k, kp, shls=shls, **kwargs)
