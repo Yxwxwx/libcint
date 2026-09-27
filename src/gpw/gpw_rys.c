@@ -8,6 +8,9 @@
 typedef struct { int n; double y[GPW_MAXPOINTS]; Z w[GPW_MAXPOINTS];
                  double offset, factor; } Measure;
 
+/* Extra precision only inside the complex rule construction; the ABI stays double. */
+typedef long double complex LZ;
+
 static int measure(Z t,Measure *m) {
     double a=creal(t), b=cimag(t), scale=fmin(a,0.);
     if (!isfinite(a)||!isfinite(b)) return GPW_INPUT;
@@ -47,71 +50,71 @@ static int measure(Z t,Measure *m) {
 
 /* Dense shifted QR for a matrix of order <=10. Householder conjugation here
  * is the usual QR factorization, not the Stieltjes polynomial inner product. */
-static int eigenvalues(int n,const Z *alpha,const Z *beta,Z *roots) {
+static int eigenvalues(int n,const LZ *alpha,const LZ *beta,LZ *roots) {
     if (n==1) { roots[0]=alpha[0]; return 0; }
     if (n==2) {
-        Z delta=csqrt((alpha[0]-alpha[1])*(alpha[0]-alpha[1])+4*beta[1]);
+        LZ delta= csqrtl((alpha[0]-alpha[1])*(alpha[0]-alpha[1])+4*beta[1]);
         roots[0]=(alpha[0]+alpha[1]+delta)*.5;
         roots[1]=(alpha[0]+alpha[1]-delta)*.5;
         return 0;
     }
     if (n==3) {
-        Z c2=-alpha[0]-alpha[1]-alpha[2];
-        Z c1=alpha[0]*alpha[1]+alpha[2]*(alpha[0]+alpha[1])-beta[1]-beta[2];
-        Z c0=-alpha[0]*alpha[1]*alpha[2]+alpha[2]*beta[1]+alpha[0]*beta[2];
-        Z p=c1-c2*c2/3., q=2*c2*c2*c2/27.-c2*c1/3.+c0;
-        Z delta=csqrt(q*q/4.+p*p*p/27.);
-        Z plus=-q/2.+delta,minus=-q/2.-delta;
-        Z u=cpow(cabs(plus)>cabs(minus)?plus:minus,1./3.);
-        if (cabs(u)>DBL_MIN) {
-            Z v=-p/(3.*u),omega=-.5+I*.86602540378443864676;
+        LZ c2=-alpha[0]-alpha[1]-alpha[2];
+        LZ c1=alpha[0]*alpha[1]+alpha[2]*(alpha[0]+alpha[1])-beta[1]-beta[2];
+        LZ c0=-alpha[0]*alpha[1]*alpha[2]+alpha[2]*beta[1]+alpha[0]*beta[2];
+        LZ p=c1-c2*c2/3., q=2*c2*c2*c2/27.-c2*c1/3.+c0;
+        LZ delta= csqrtl(q*q/4.+p*p*p/27.);
+        LZ plus=-q/2.+delta,minus=-q/2.-delta;
+        LZ u= cpowl( cabsl(plus)> cabsl(minus)?plus:minus,1.L/3.L);
+        if ( cabsl(u)>DBL_MIN) {
+            LZ v=-p/(3.*u),omega=-.5+I*.86602540378443864676L;
             roots[0]=u+v-c2/3.;
-            roots[1]=omega*u+conj(omega)*v-c2/3.;
-            roots[2]=conj(omega)*u+omega*v-c2/3.;
+            roots[1]=omega*u+ conjl(omega)*v-c2/3.;
+            roots[2]= conjl(omega)*u+omega*v-c2/3.;
             return 0;
         }
     }
-    Z a[100]={0};
+    LZ a[100]={0};
     for (int i=0;i<n;++i) {
         a[i*10+i]=alpha[i];
-        if (i) a[(i-1)*10+i]=a[i*10+i-1]=csqrt(beta[i]);
+        if (i) a[(i-1)*10+i]=a[i*10+i-1]= csqrtl(beta[i]);
     }
     for (int size=n;size>1;--size) {
         int iteration;
         for (iteration=0;iteration<300;++iteration) {
             int last=size-1;
-            if (cabs(a[last*10+last-1]) < 4e-15*(1+cabs(a[last*10+last])+cabs(a[(last-1)*10+last-1])))
+            if ( cabsl(a[last*10+last-1]) < (32*LDBL_EPSILON)*(1+ cabsl(a[last*10+last])+ cabsl(a[(last-1)*10+last-1])))
                 break;
-            Z x=a[(last-1)*10+last-1], z=a[last*10+last];
-            Z disc=csqrt((x-z)*(x-z)+4.*a[(last-1)*10+last]*a[last*10+last-1]);
-            Z shift1=(x+z+disc)*.5, shift2=(x+z-disc)*.5;
-            Z shift=cabs(shift1-z)<cabs(shift2-z)?shift1:shift2;
-            Z q[100]={0}, r[100];
+            LZ x=a[(last-1)*10+last-1], z=a[last*10+last];
+            LZ disc= csqrtl((x-z)*(x-z)+4.*a[(last-1)*10+last]*a[last*10+last-1]);
+            LZ shift1=(x+z+disc)*.5, shift2=(x+z-disc)*.5;
+            LZ shift= cabsl(shift1-z)< cabsl(shift2-z)?shift1:shift2;
+            LZ q[100]={0}, r[100];
             memcpy(r,a,sizeof(r));
             for (int i=0;i<size;++i) { r[i*10+i]-=shift; q[i*10+i]=1; }
             for (int k=0;k<size-1;++k) {
-                Z v[10]={0}; double norm=0;
-                for (int i=k;i<size;++i) { v[i]=r[i*10+k]; norm+=creal(v[i]*conj(v[i])); }
-                norm=sqrt(norm);
+                LZ v[10]={0}; long double norm=0;
+                for (int i=k;i<size;++i) { v[i]=r[i*10+k]; norm+= creall(v[i]* conjl(v[i])); }
+                norm= sqrtl(norm);
                 if (norm<DBL_MIN) continue;
-                v[k]+=cabs(v[k])>0?v[k]/cabs(v[k])*norm:norm;
-                double vnorm=0;
-                for (int i=k;i<size;++i) vnorm+=creal(v[i]*conj(v[i]));
+                v[k]+= cabsl(v[k])>0?v[k]/ cabsl(v[k])*norm:norm;
+                long double vnorm=0;
+                for (int i=k;i<size;++i) vnorm+= creall(v[i]* conjl(v[i]));
                 for (int j=k;j<size;++j) {
-                    Z dot=0;
-                    for (int i=k;i<size;++i) dot+=conj(v[i])*r[i*10+j];
+                    LZ dot=0;
+                    for (int i=k;i<size;++i) dot+= conjl(v[i])*r[i*10+j];
                     dot*=2/vnorm;
                     for (int i=k;i<size;++i) r[i*10+j]-=v[i]*dot;
                 }
                 for (int i=0;i<size;++i) {
-                    Z dot=0;
+                    LZ dot=0;
                     for (int j=k;j<size;++j) dot+=q[i*10+j]*v[j];
                     dot*=2/vnorm;
-                    for (int j=k;j<size;++j) q[i*10+j]-=dot*conj(v[j]);
+                    for (int j=k;j<size;++j) q[i*10+j]-=dot* conjl(v[j]);
                 }
             }
             for (int i=0;i<size;++i) for (int j=0;j<size;++j) {
-                Z value=0;
+                LZ value=0;
                 for (int k=0;k<size;++k) value+=r[i*10+k]*q[k*10+j];
                 a[i*10+j]=value+(i==j?shift:0);
             }
@@ -163,51 +166,89 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
     Measure m;
     int status=measure(t,&m);
     if (status) return status;
-    Z p[GPW_MAXPOINTS],old[GPW_MAXPOINTS];
-    Z alpha[10], beta[10]={0}, norms[10];
-    for (int j=0;j<m.n;++j) { p[j]=1; old[j]=0; }
-    double absnorm=0;
-    for (int k=0;k<n;++k) {
-        Z norm=0,first=0; absnorm=0;
+    if (n==2) {
+        /* Near a zero of the complex zeroth moment, the two Stieltjes
+         * diagonal entries become large and opposite. Form the monic
+         * polynomial directly from the 2x2 moment system to avoid that
+         * cancellation. This also avoids division by the zeroth moment. */
+        LZ f[4]={0},g[4],roots[2]; long double bounds[4]={0},amplitude=0;
         for (int j=0;j<m.n;++j) {
-            Z v=m.w[j]*p[j]*p[j]; norm+=v; first+=m.y[j]*v; absnorm+=cabs(v);
+            LZ v=m.w[j];
+            for (int k=0;k<4;++k) { f[k]+=v; bounds[k]+=cabsl(v); v*=m.y[j]; }
         }
-        if (!isfinite(absnorm)||!isfinite(creal(norm))||!isfinite(cimag(norm))||
-            cabs(norm)<DBL_MIN || cabs(norm)<1e-13*absnorm) return GPW_NUMERIC;
+        for (int k=0;k<4;++k) amplitude=fmaxl(amplitude,cabsl(f[k]));
+        if (!(amplitude>DBL_MIN)||!isfinite(amplitude)) return GPW_NUMERIC;
+        for (int k=0;k<4;++k) g[k]=f[k]/amplitude;
+        LZ det=g[0]*g[2]-g[1]*g[1];
+        if (cabsl(det)<1e-13*(cabsl(g[0]*g[2])+cabsl(g[1]*g[1]))) return GPW_NUMERIC;
+        LZ c1=(g[1]*g[2]-g[0]*g[3])/det,c0=(g[1]*g[3]-g[2]*g[2])/det;
+        LZ disc=csqrtl(c1*c1-4*c0),plus=-c1+disc,minus=-c1-disc;
+        roots[0]=.5*(cabsl(plus)>cabsl(minus)?plus:minus);
+        if (cabsl(roots[0])<DBL_MIN) return GPW_NUMERIC;
+        roots[1]=c0/roots[0];
+        if (cabsl(roots[0]-roots[1])<1e-14*(1+cabsl(roots[0])+cabsl(roots[1]))) return GPW_NUMERIC;
+        weights[0]=(f[1]-roots[1]*f[0])/(roots[0]-roots[1]);
+        weights[1]=f[0]-weights[0];
+        for (int i=0;i<2;++i) {
+            nodes[i]=m.offset+m.factor*roots[i];
+            if (!isfinite(creal(nodes[i]))||!isfinite(cimag(nodes[i]))||
+                !isfinite(creal(weights[i]))||!isfinite(cimag(weights[i]))) return GPW_NUMERIC;
+        }
+        long double worst=0; LZ powers[2]={1,1};
+        for (int k=0;k<4;++k) {
+            long double err=cabsl(weights[0]*powers[0]+weights[1]*powers[1]-f[k])/fmaxl(bounds[k],DBL_MIN);
+            if (!isfinite(err)) return GPW_NUMERIC;
+            worst=fmaxl(worst,err);
+            for (int i=0;i<2;++i) powers[i]*=roots[i];
+        }
+        *residual=worst;
+        return worst<2e-11?GPW_SUCCESS:GPW_NUMERIC;
+    }
+    LZ p[GPW_MAXPOINTS],old[GPW_MAXPOINTS];
+    LZ alpha[10], beta[10]={0}, norms[10];
+    for (int j=0;j<m.n;++j) { p[j]=1; old[j]=0; }
+    long double absnorm=0;
+    for (int k=0;k<n;++k) {
+        LZ norm=0,first=0; absnorm=0;
+        for (int j=0;j<m.n;++j) {
+            LZ v=m.w[j]*p[j]*p[j]; norm+=v; first+=m.y[j]*v; absnorm+=cabsl(v);
+        }
+        if (!isfinite(absnorm)||!isfinite(creall(norm))||!isfinite(cimagl(norm))||
+            cabsl(norm)<DBL_MIN || cabsl(norm)<1e-13*absnorm) return GPW_NUMERIC;
         norms[k]=norm; alpha[k]=first/norm;
         if (k) beta[k]=norm/norms[k-1];
         if (k+1<n) for (int j=0;j<m.n;++j) {
-            Z next=(m.y[j]-alpha[k])*p[j]-beta[k]*old[j];
+            LZ next=(m.y[j]-alpha[k])*p[j]-beta[k]*old[j];
             old[j]=p[j]; p[j]=next;
         }
     }
-    Z roots[10];
+    LZ roots[10];
     status=eigenvalues(n,alpha,beta,roots);
     if (status) return status;
     for (int i=0;i<n;++i) {
-        Z value=1,prev=0,denom=1;
+        LZ value=1,prev=0,denom=1;
         for (int k=1;k<n;++k) {
-            Z next=(roots[i]-alpha[k-1])*value-beta[k-1]*prev;
+            LZ next=(roots[i]-alpha[k-1])*value-beta[k-1]*prev;
             prev=value; value=next;
             denom+=value*value*norms[0]/norms[k];
         }
         weights[i]=norms[0]/denom;
         nodes[i]=m.offset+m.factor*roots[i];
-        if (!isfinite(creal(weights[i]))||!isfinite(cimag(weights[i]))||
-            !isfinite(creal(nodes[i]))||!isfinite(cimag(nodes[i]))) return GPW_NUMERIC;
+        if (!isfinite(creall(weights[i]))||!isfinite(cimagl(weights[i]))||
+            !isfinite(creall(nodes[i]))||!isfinite(cimagl(nodes[i]))) return GPW_NUMERIC;
     }
     /* Check scaled y moments, not clustered s powers alone. */
-    double worst=0;
-    Z powers[10];
+    long double worst=0;
+    LZ powers[10];
     for (int i=0;i<n;++i) powers[i]=1;
     for (int j=0;j<m.n;++j) p[j]=1;
     for (int k=0;k<2*n;++k) {
-        Z exact=0,rebuild=0; double bound=0;
-        for (int j=0;j<m.n;++j) { Z v=m.w[j]*p[j]; exact+=v; bound+=cabs(v); p[j]*=m.y[j]; }
+        LZ exact=0,rebuild=0; long double bound=0;
+        for (int j=0;j<m.n;++j) { LZ v=m.w[j]*p[j]; exact+=v; bound+=cabsl(v); p[j]*=m.y[j]; }
         for (int i=0;i<n;++i) { rebuild+=weights[i]*powers[i]; powers[i]*=roots[i]; }
-        double err=cabs(exact-rebuild)/fmax(bound,DBL_MIN);
+        long double err=cabsl(exact-rebuild)/fmaxl(bound,DBL_MIN);
         if (!isfinite(err)||!isfinite(bound)) return GPW_NUMERIC;
-        worst=fmax(worst,err);
+        worst=fmaxl(worst,err);
     }
     *residual=worst;
     return worst<2e-11?GPW_SUCCESS:GPW_NUMERIC;
