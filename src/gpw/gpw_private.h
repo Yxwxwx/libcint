@@ -19,9 +19,16 @@ typedef struct {
     double c2s[28*13]; /* row-major (ncart,nsph); no s/p rescaling */
 } Shell;
 
+typedef struct {
+    double inv2p,inv2q,rho,pfrac,qfrac,cross,pref,phase;
+    double center[3];
+} PrimitiveData;
+
 struct GPWWorkspace {
     size_t capacity;
-    Z *a,*b;
+    Z *a,*b,*c;
+    PrimitiveData *params;
+    size_t param_capacity;
     Z axis[3][7][13][7][10];
     uint64_t rules,special;
 };

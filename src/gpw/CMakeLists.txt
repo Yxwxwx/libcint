@@ -1,10 +1,18 @@
 if(I8 OR PYPZPX)
   message(FATAL_ERROR "GPW requires 32-bit FINT and PySCF (px,py,pz) ordering")
 endif()
-add_library(gpw SHARED gpw_int2e.c gpw_int1e.c gpw_rys.c ../cart2sph.c ../fblas.c)
+add_library(gpw SHARED gpw_int2e.c gpw_int1e.c gpw_rys.c ../cart2sph.c ../fblas.c
+  ../rys_roots.c ../rys_wheeler.c ../fmt.c ../eigh.c ../find_roots.c)
 target_include_directories(gpw PUBLIC ${PROJECT_SOURCE_DIR}/include
   PRIVATE ${PROJECT_BINARY_DIR}/include ${PROJECT_BINARY_DIR}/src ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(gpw PRIVATE m)
+target_compile_definitions(gpw PRIVATE KEEP_GOING)
+if(QUADMATH_FOUND)
+  target_link_libraries(gpw PRIVATE quadmath)
+endif()
+if(WITH_POLYNOMIAL_FIT)
+  target_sources(gpw PRIVATE ../polyfits.c ../sr_rys_polyfits.c)
+endif()
 set_target_properties(gpw PROPERTIES C_VISIBILITY_PRESET hidden
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR} VERSION 0.2.0 SOVERSION 0)
 install(TARGETS gpw LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})

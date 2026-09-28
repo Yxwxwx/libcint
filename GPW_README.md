@@ -2,8 +2,10 @@
 
 This libcint fork provides `libgpw` and `include/gpw.h`. It computes GTO–PW
 overlap, kinetic and nuclear attraction, and the mixed two-electron `gpgg` and
-`gppg` integrals. All numerical code is in `src/gpw`; no Mixed-GTO-PW checkout,
-C++ extension, BLAS or LAPACK is needed. The ordinary `libcint` library retains
+`gppg` integrals. The mixed kernels are in `src/gpw`, with libcint's original
+real Rys and Cartesian-to-spherical sources compiled into `libgpw`. No
+Mixed-GTO-PW checkout, C++ extension, BLAS or LAPACK is needed. As with ordinary
+libcint, libquadmath is used when detected at build time. The ordinary `libcint` library retains
 its original integral code and ABI. `WITH_GPW` defaults to `OFF`.
 
 ## Build and use with PySCF
@@ -53,8 +55,13 @@ computes only the requested shell block. General contractions are retained.
 `prepare` creates a GPW-specific immutable cache, **not** libcint's `CINTOpt`.
 It stores the molecule and parsed shells/transforms, and rejects changed inputs
 on every call. Multiple threads may share it; close it after all calls finish.
-The C API also exposes reusable workspaces, one per concurrent caller. Python
-allocates a workspace per shell batch; it does not maintain global mutable work.
+The C API also exposes reusable workspaces, one per concurrent caller. Each
+Python call reuses one workspace across all its shell blocks; concurrent calls
+have separate workspaces. Wavevector-independent primitive data is prepared
+once per shell batch. General contractions accumulate one shell at a time;
+single contractions share buffers and combine their coefficients with the
+primitive prefactor. Workspaces hold three Cartesian buffers and a reusable
+primitive-parameter table; `gpw_workspace_bytes` includes both.
 
 ## Definitions and normalization
 
@@ -110,7 +117,8 @@ untouched; any failure after computation starts clears the entire requested
 output, including earlier batch elements. Python raises instead of returning
 failed output. Finite input is not a guarantee that every extreme parameter is
 numerically supported: the complex Rys panel budget and conditioning checks may
-return `GPW_RANGE`/`GPW_NUMERIC`. There is no fallback or silent screening.
+return `GPW_RANGE`/`GPW_NUMERIC`. There is no alternative integral backend or
+approximate screening; exact zero contraction coefficients may be skipped.
 
 ## One-electron derivation
 
@@ -136,10 +144,17 @@ the prefactor includes `exp(phase-sigma)`. For negative `Re(T)` its real exponen
 is evaluated as `-p tau² |A-C|²-(1-tau²)k²/(4p)`, avoiding cancellation and
 preserving point-nucleus tails when overlap underflows.
 
-The complex root construction uses scaled discrete Stieltjes polynomials and
-bilinear products, with internal small-matrix QR; it neither calls the original
-real `CINTrys_roots` nor reimplements a second backend outside libcint. Root
-reconstruction checks do not provide a uniform bound on discretization error;
+For exactly real nonnegative `T`, GPW calls the original `CINTrys_roots`, converts
+its `u=s/(1-s)` nodes to `s`, and checks the reconstructed Boys moments. A rule
+that fails this check is evaluated through the general GPW Rys construction.
+General complex `T` uses scaled discrete Stieltjes polynomials and bilinear
+products, with internal small-matrix QR and specialized one/two-root paths.
+Both paths keep their numerical residual checks. Low-angular-momentum
+recurrences use fixed loop bounds, and contiguous contraction/transform loops
+allow compiler vectorization without changing the public ABI. Optimizations
+must preserve numerical checks and use general mathematical structure, never
+molecule-specific branches, fitted corrections, or relaxed acceptance tolerances.
+Root reconstruction checks do not provide a uniform bound on discretization error;
 the independent checks below establish accuracy at their tested inputs.
 
 ## Validation

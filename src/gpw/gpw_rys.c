@@ -4,6 +4,7 @@
  * See GPW_README.md for the conventions and numerical limits. */
 #include "gpw_private.h"
 #include "gpw_legendre.h"
+#include "rys_roots.h"
 
 typedef struct { int n; double y[GPW_MAXPOINTS]; Z w[GPW_MAXPOINTS];
                  double offset, factor; } Measure;
@@ -129,6 +130,27 @@ static int eigenvalues(int n,const LZ *alpha,const LZ *beta,LZ *roots) {
 int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
     if (n<1||n>10) return GPW_RANGE;
     if (!isfinite(creal(t))||!isfinite(cimag(t))) return GPW_INPUT;
+    /* Reuse libcint's fitted/asymptotic rules exactly on its real domain.
+     * libcint returns u=s/(1-s); GPW recurrences use s itself. */
+    if (cimag(t)==0. && creal(t)>=0.) {
+        double u[10],w[10],f[20],powers[10];
+        if (CINTrys_roots(n,creal(t),u,w)==0) {
+            gamma_inc_like(f,creal(t),2*n-1);
+            double worst=0;
+            for (int i=0;i<n;++i) {
+                nodes[i]=u[i]/(1.+u[i]); weights[i]=w[i]; powers[i]=1.;
+            }
+            for (int k=0;k<2*n;++k) {
+                double sum=0;
+                for (int i=0;i<n;++i) { sum+=w[i]*powers[i]; powers[i]*=creal(nodes[i]); }
+                double err=fabs(sum-f[k])/fmax(f[k],DBL_MIN);
+                if (!isfinite(err)) { worst=INFINITY; break; }
+                worst=fmax(worst,err);
+            }
+            /* Keep even the original low-order path's stricter tolerance. */
+            if (worst<2e-12) { *residual=worst; return GPW_SUCCESS; }
+        }
+    }
     /* Low-order analytic cases use a convergent small-|T| moment series.
      * This is a Rys rule, not an integral-backend fallback. Restrict the domain
      * to avoid cancellation of clustered high-|T| power moments. */
@@ -153,9 +175,13 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
             weights[1]=moments[0]-weights[0];
         }
         double worst=0;
+        Z powers[2]={1.,1.};
         for (int m=0;m<2*n;++m) {
             Z v=0;
-            for (int i=0;i<n;++i) v+=weights[i]*cpow(nodes[i],m);
+            for (int i=0;i<n;++i) {
+                v+=weights[i]*powers[i];
+                powers[i]*=nodes[i];
+            }
             double err=cabs(v-moments[m])/(cabs(moments[m])+DBL_MIN);
             if (!isfinite(err)) return GPW_NUMERIC;
             worst=fmax(worst,err);
@@ -166,6 +192,22 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
     Measure m;
     int status=measure(t,&m);
     if (status) return status;
+    if (n==1) {
+        LZ f0=0,f1=0; long double bound0=0,bound1=0;
+        for (int j=0;j<m.n;++j) {
+            f0+=(LZ)m.w[j]; f1+=(LZ)m.w[j]*m.y[j];
+            long double amplitude=cabsl((LZ)m.w[j]);
+            bound0+=amplitude; bound1+=amplitude*fabs(m.y[j]);
+        }
+        if (!isfinite(bound0)||cabsl(f0)<DBL_MIN||cabsl(f0)<1e-13*bound0)
+            return GPW_NUMERIC;
+        LZ root=f1/f0;
+        nodes[0]=m.offset+m.factor*root; weights[0]=f0;
+        if (!isfinite(creal(nodes[0]))||!isfinite(cimag(nodes[0]))) return GPW_NUMERIC;
+        *residual=fmaxl(cabsl((LZ)weights[0]-f0)/fmaxl(bound0,DBL_MIN),
+                        cabsl((LZ)weights[0]*root-f1)/fmaxl(bound1,DBL_MIN));
+        return isfinite(*residual)&&*residual<2e-11?GPW_SUCCESS:GPW_NUMERIC;
+    }
     if (n==2) {
         /* Near a zero of the complex zeroth moment, the two Stieltjes
          * diagonal entries become large and opposite. Form the monic
@@ -174,7 +216,11 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
         LZ f[4]={0},g[4],roots[2]; long double bounds[4]={0},amplitude=0;
         for (int j=0;j<m.n;++j) {
             LZ v=m.w[j];
-            for (int k=0;k<4;++k) { f[k]+=v; bounds[k]+=cabsl(v); v*=m.y[j]; }
+            long double magnitude=cabsl(v);
+            for (int k=0;k<4;++k) {
+                f[k]+=v; bounds[k]+=magnitude;
+                v*=m.y[j]; magnitude*=fabs(m.y[j]);
+            }
         }
         for (int k=0;k<4;++k) amplitude=fmaxl(amplitude,cabsl(f[k]));
         if (!(amplitude>DBL_MIN)||!isfinite(amplitude)) return GPW_NUMERIC;
@@ -205,13 +251,15 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
         return worst<2e-11?GPW_SUCCESS:GPW_NUMERIC;
     }
     LZ p[GPW_MAXPOINTS],old[GPW_MAXPOINTS];
+    long double absweight[GPW_MAXPOINTS];
     LZ alpha[10], beta[10]={0}, norms[10];
-    for (int j=0;j<m.n;++j) { p[j]=1; old[j]=0; }
+    for (int j=0;j<m.n;++j) { p[j]=1; old[j]=0; absweight[j]=cabsl((LZ)m.w[j]); }
     long double absnorm=0;
     for (int k=0;k<n;++k) {
         LZ norm=0,first=0; absnorm=0;
         for (int j=0;j<m.n;++j) {
-            LZ v=m.w[j]*p[j]*p[j]; norm+=v; first+=m.y[j]*v; absnorm+=cabsl(v);
+            LZ v=m.w[j]*p[j]*p[j]; norm+=v; first+=m.y[j]*v;
+            absnorm+=absweight[j]*(creall(p[j])*creall(p[j])+cimagl(p[j])*cimagl(p[j]));
         }
         if (!isfinite(absnorm)||!isfinite(creall(norm))||!isfinite(cimagl(norm))||
             cabsl(norm)<DBL_MIN || cabsl(norm)<1e-13*absnorm) return GPW_NUMERIC;
@@ -241,13 +289,19 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
     long double worst=0;
     LZ powers[10];
     for (int i=0;i<n;++i) powers[i]=1;
-    for (int j=0;j<m.n;++j) p[j]=1;
+    LZ exact[20]={0}; long double bounds[20]={0};
+    for (int j=0;j<m.n;++j) {
+        LZ v=m.w[j]; long double magnitude=absweight[j];
+        for (int k=0;k<2*n;++k) {
+            exact[k]+=v; bounds[k]+=magnitude;
+            v*=m.y[j]; magnitude*=fabs(m.y[j]);
+        }
+    }
     for (int k=0;k<2*n;++k) {
-        LZ exact=0,rebuild=0; long double bound=0;
-        for (int j=0;j<m.n;++j) { LZ v=m.w[j]*p[j]; exact+=v; bound+=cabsl(v); p[j]*=m.y[j]; }
+        LZ rebuild=0;
         for (int i=0;i<n;++i) { rebuild+=weights[i]*powers[i]; powers[i]*=roots[i]; }
-        long double err=cabsl(exact-rebuild)/fmaxl(bound,DBL_MIN);
-        if (!isfinite(err)||!isfinite(bound)) return GPW_NUMERIC;
+        long double err=cabsl(exact[k]-rebuild)/fmaxl(bounds[k],DBL_MIN);
+        if (!isfinite(err)||!isfinite(bounds[k])) return GPW_NUMERIC;
         worst=fmaxl(worst,err);
     }
     *residual=worst;

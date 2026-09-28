@@ -279,21 +279,31 @@ def _evaluate(kind, mol, k, kp=None, *, shls=None, cart=None,
     loc = np.concatenate(([0], np.cumsum(sizes)))
     lib = library()
     handle = None if opt is None else opt._handle
-    for shell in selected:
-        indices = np.asarray(shell, dtype=np.int32)
-        block = np.empty((len(waves), *(int(sizes[s]) for s in shell)), dtype=np.complex128)
-        common = (double_pointer(block), block.size)
-        if rank == 1:
-            status = lib.gpw_int1e_batch(*common, {'ovlp': 1, 'kin': 2, 'nuc': 3}[kind], int(cart),
-                int_pointer(indices), double_pointer(waves), len(waves), *args, handle, None)
-        else:
-            status = lib.gpw_int2e_batch(*common, rank, int(cart), int_pointer(indices),
-                double_pointer(waves), double_pointer(other), len(waves), *args, handle, None)
-        check(status, f'{kind}, shls={shell}')
-        if shls is None:
-            out[(slice(None),) + tuple(slice(loc[s], loc[s+1]) for s in shell)] = block
-        else:
-            out[...] = block
+    cart_sizes = [(int(l)+1)*(int(l)+2)//2*int(nc) for l, nc in bas[:, [1, 3]]]
+    capacity = 1
+    for size in ([cart_sizes[s] for s in shls] if shls is not None else
+                 [max(cart_sizes, default=0)]*rank):
+        capacity *= size
+    workspace = Handle()
+    check(lib.gpw_workspace_create(ct.byref(workspace), capacity), 'allocating workspace')
+    try:
+        for shell in selected:
+            indices = np.asarray(shell, dtype=np.int32)
+            block = np.empty((len(waves), *(int(sizes[s]) for s in shell)), dtype=np.complex128)
+            common = (double_pointer(block), block.size)
+            if rank == 1:
+                status = lib.gpw_int1e_batch(*common, {'ovlp': 1, 'kin': 2, 'nuc': 3}[kind], int(cart),
+                    int_pointer(indices), double_pointer(waves), len(waves), *args, handle, workspace)
+            else:
+                status = lib.gpw_int2e_batch(*common, rank, int(cart), int_pointer(indices),
+                    double_pointer(waves), double_pointer(other), len(waves), *args, handle, workspace)
+            check(status, f'{kind}, shls={shell}')
+            if shls is None:
+                out[(slice(None),) + tuple(slice(loc[s], loc[s+1]) for s in shell)] = block
+            else:
+                out[...] = block
+    finally:
+        lib.gpw_workspace_destroy(workspace)
     out *= scale.reshape((-1,) + (1,)*rank)
     return out[0] if single else out
 

@@ -118,60 +118,113 @@ int gpw_workspace_create(GPWWorkspace **out,size_t capacity) {
     if (!out) return GPW_INPUT;
     *out=NULL;
     size_t size;
-    if (multiply(capacity,2*sizeof(Z),&size)) return GPW_RANGE;
-    GPWWorkspace *w=calloc(1,sizeof(*w));
+    if (multiply(capacity,3*sizeof(Z),&size)) return GPW_RANGE;
+    GPWWorkspace *w=malloc(sizeof(*w));
     if (!w) return GPW_MEMORY;
-    w->a=calloc(capacity?capacity*2:1,sizeof(Z));
+    w->a=malloc(size?size:sizeof(Z));
     if (!w->a) { free(w); return GPW_MEMORY; }
-    w->b=w->a+capacity; w->capacity=capacity;
+    w->b=w->a+capacity; w->c=w->b+capacity; w->capacity=capacity;
+    w->params=NULL; w->param_capacity=0;
+    w->rules=0; w->special=0;
     *out=w;
     return 0;
 }
-void gpw_workspace_destroy(GPWWorkspace *w) { if (w) { free(w->a); free(w); } }
-size_t gpw_workspace_bytes(const GPWWorkspace *w) { return w?sizeof(*w)+w->capacity*2*sizeof(Z):0; }
+void gpw_workspace_destroy(GPWWorkspace *w) { if (w) { free(w->params); free(w->a); free(w); } }
+size_t gpw_workspace_bytes(const GPWWorkspace *w) {
+    return w?sizeof(*w)+w->capacity*3*sizeof(Z)+w->param_capacity*sizeof(PrimitiveData):0;
+}
 uint64_t gpw_workspace_rules(const GPWWorkspace *w) { return w?w->rules:0; }
 uint64_t gpw_workspace_special(const GPWWorkspace *w) { return w?w->special:0; }
 
-static int primitive(GPWWorkspace *work,const Shell *a,const Shell *b,const Shell *c,
-                     double p,double beta,double gamma,const double *k,const double *kp) {
-    const int lc=c?c->l:0, n=(a->l+b->l+lc)/2+1;
-    const double q=beta+gamma, rho=p*q/(p+q);
-    Z P[3],Q[3],D[3],t=0,phase=0;
-    for (int d=0;d<3;++d) {
-        P[d]=a->center[d]+I*k[d]/(2*p);
-        phase+=I*k[d]*a->center[d]-k[d]*k[d]/(4*p);
-        if (c) {
-            Q[d]=(beta*b->center[d]+gamma*c->center[d])/q;
-            phase-=beta*gamma/q*pow(b->center[d]-c->center[d],2);
-        } else {
-            Q[d]=b->center[d]-I*kp[d]/(2*q);
-            phase-=I*kp[d]*b->center[d]+kp[d]*kp[d]/(4*q);
+/* The real Gaussian product and exponent factors are independent of the
+ * wavevectors. Prepare once for the entire shell batch, not once per k. */
+static int prepare_primitives(GPWWorkspace *work,const Shell *a,const Shell *b,const Shell *c) {
+    size_t count,bytes;
+    if (multiply(a->np,b->np,&count)||multiply(count,c?c->np:1,&count)||
+        multiply(count,sizeof(PrimitiveData),&bytes)) return GPW_RANGE;
+    if (count>work->param_capacity) {
+        PrimitiveData *params=realloc(work->params,bytes);
+        if (!params) return GPW_MEMORY;
+        work->params=params; work->param_capacity=count;
+    }
+    size_t index=0;
+    for (int ic=0;ic<(c?c->np:1);++ic) for (int ib=0;ib<b->np;++ib) {
+        double beta=b->exps[ib],gamma=c?c->exps[ic]:0.,q=beta+gamma;
+        double center[3],phase=0;
+        for (int d=0;d<3;++d) {
+            center[d]=c?(beta*b->center[d]+gamma*c->center[d])/q:b->center[d];
+            if (c) phase-=beta*gamma/q*pow(b->center[d]-c->center[d],2);
         }
-        D[d]=P[d]-Q[d]; t+=rho*D[d]*D[d];
+        for (int ia=0;ia<a->np;++ia) {
+            double p=a->exps[ia];
+            PrimitiveData *v=work->params+index++;
+            v->inv2p=.5/p; v->inv2q=.5/q; v->rho=p*q/(p+q);
+            v->pfrac=p/(p+q); v->qfrac=q/(p+q); v->cross=.5/(p+q);
+            v->pref=2*pow(GPW_PI,2.5)/(p*q*sqrt(p+q))*a->sp*b->sp*(c?c->sp:1.);
+            v->phase=phase;
+            memcpy(v->center,center,sizeof(center));
+        }
+    }
+    return 0;
+}
+
+static inline void axis_recurrence(Z g[7][13][7][10],int root,int la,int lb,int lc,
+                                  Z base,Z da,Z db,Z va,Z vb,Z cross,double bc) {
+#define G(i,j,h) g[i][j][h][root]
+    G(0,0,0)=base;
+    for (int j=1;j<=lb+lc;++j)
+        G(0,j,0)=db*G(0,j-1,0)+(j>1?(j-1)*vb*G(0,j-2,0):0.);
+    for (int i=1;i<=la;++i) for (int j=0;j<=lb+lc;++j)
+        G(i,j,0)=da*G(i-1,j,0)+(i>1?(i-1)*va*G(i-2,j,0):0.)+
+                                   (j?j*cross*G(i-1,j-1,0):0.);
+    for (int h=1;h<=lc;++h) for (int i=0;i<=la;++i)
+        for (int j=0;j<=lb+lc-h;++j)
+            G(i,j,h)=G(i,j+1,h-1)+bc*G(i,j,h-1);
+#undef G
+}
+
+static int primitive(GPWWorkspace *work,const Shell *a,const Shell *b,const Shell *c,
+                     const PrimitiveData *v,const double *k,const double *kp,double coeff) {
+    const int lc=c?c->l:0, n=(a->l+b->l+lc)/2+1;
+    Z P[3],Q[3],D[3],t=0,phase=v->phase;
+    for (int d=0;d<3;++d) {
+        P[d]=a->center[d]+I*k[d]*v->inv2p;
+        phase+=I*k[d]*a->center[d]-k[d]*k[d]*(.5*v->inv2p);
+        Q[d]=v->center[d];
+        if (!c) {
+            Q[d]-=I*kp[d]*v->inv2q;
+            phase-=I*kp[d]*b->center[d]+kp[d]*kp[d]*(.5*v->inv2q);
+        }
+        D[d]=P[d]-Q[d]; t+=v->rho*D[d]*D[d];
     }
     Z s[10],weights[10]; double residual;
     int status=gpw_rule(n,t,s,weights,&residual);
     work->rules++;
     if (fabs(creal(t))>20||fabs(cimag(t))>12) work->special++;
     if (status) return status;
-    Z pref=2*pow(GPW_PI,2.5)/(p*q*sqrt(p+q))*cexp(phase-fmin(creal(t),0.))*a->sp*b->sp*(c?c->sp:1.);
+    Z pref=v->pref*cexp(phase-fmin(creal(t),0.))*coeff;
     for (int root=0;root<n;++root) {
-        Z va=(1-q*s[root]/(p+q))/(2*p), vb=(1-p*s[root]/(p+q))/(2*q);
-        Z cross=s[root]/(2*(p+q));
+        Z va=(1-v->qfrac*s[root])*v->inv2p, vb=(1-v->pfrac*s[root])*v->inv2q;
+        Z cross=s[root]*v->cross;
         for (int d=0;d<3;++d) {
-            Z da=P[d]-a->center[d]-q*s[root]/(p+q)*D[d];
-            Z db=Q[d]-b->center[d]+p*s[root]/(p+q)*D[d];
-#define G(i,j,h) work->axis[d][i][j][h][root]
-            G(0,0,0)=d==2?weights[root]*pref:1.;
-            for (int j=1;j<=b->l+lc;++j)
-                G(0,j,0)=db*G(0,j-1,0)+(j>1?(j-1)*vb*G(0,j-2,0):0.);
-            for (int i=1;i<=a->l;++i) for (int j=0;j<=b->l+lc;++j)
-                G(i,j,0)=da*G(i-1,j,0)+(i>1?(i-1)*va*G(i-2,j,0):0.)+
-                                          (j?j*cross*G(i-1,j-1,0):0.);
-            for (int h=1;h<=lc;++h) for (int i=0;i<=a->l;++i)
-                for (int j=0;j<=b->l+lc-h;++j)
-                    G(i,j,h)=G(i,j+1,h-1)+(b->center[d]-c->center[d])*G(i,j,h-1);
-#undef G
+            Z da=P[d]-a->center[d]-v->qfrac*s[root]*D[d];
+            Z db=Q[d]-b->center[d]+v->pfrac*s[root]*D[d];
+            Z base=d==2?weights[root]*pref:1.;
+            double bc=c?b->center[d]-c->center[d]:0.;
+            /* Fixed low-l bounds let the compiler expand the same recurrence,
+             * matching libcint's one/two-root specialization without new formulas. */
+#define AXIS(A,B,C) axis_recurrence(work->axis[d],root,A,B,C,base,da,db,va,vb,cross,bc)
+#define LOW(A,B,C) case (A*16+B*4+C): AXIS(A,B,C); break
+            if (n<=2) switch (a->l*16+b->l*4+lc) {
+                LOW(0,0,0); LOW(1,0,0); LOW(0,1,0); LOW(0,0,1);
+                LOW(2,0,0); LOW(0,2,0); LOW(0,0,2);
+                LOW(1,1,0); LOW(1,0,1); LOW(0,1,1);
+                LOW(3,0,0); LOW(0,3,0); LOW(0,0,3);
+                LOW(2,1,0); LOW(2,0,1); LOW(1,2,0);
+                LOW(0,2,1); LOW(1,0,2); LOW(0,1,2); LOW(1,1,1);
+            } else { AXIS(a->l,b->l,lc); }
+#undef LOW
+#undef AXIS
         }
     }
     return 0;
@@ -180,31 +233,58 @@ static int primitive(GPWWorkspace *work,const Shell *a,const Shell *b,const Shel
 static int shell_integral(GPWWorkspace *work,const Shell *a,const Shell *b,const Shell *c,
                          const double *k,const double *kp) {
     const int n=(a->l+b->l+(c?c->l:0))/2+1, fc=c?c->nf:1;
-    const size_t nb=(size_t)b->nf*b->nc, nc=c?(size_t)c->nf*c->nc:1;
-    size_t block=(size_t)a->nf*a->nc*nb*nc;
+    const int cc_count=c?c->nc:1;
+    const size_t na=(size_t)a->nf*a->nc, nb=(size_t)b->nf*b->nc;
+    size_t block=na*nb*cc_count*fc;
     memset(work->a,0,block*sizeof(Z));
-    for (int ia=0;ia<a->np;++ia) for (int ib=0;ib<b->np;++ib)
-        for (int ic=0;ic<(c?c->np:1);++ic) {
-            int status=primitive(work,a,b,c,a->exps[ia],b->exps[ib],c?c->exps[ic]:0,k,kp);
-            if (status) return status;
-            for (int i=0;i<a->nf;++i) for (int j=0;j<b->nf;++j) for (int h=0;h<fc;++h) {
-                const int zero[3]={0};
-                const int *ap=a->powers[i], *bp=b->powers[j], *cp=c?c->powers[h]:zero;
-                const Z *x=work->axis[0][ap[0]][bp[0]][cp[0]],
-                        *y=work->axis[1][ap[1]][bp[1]][cp[1]],
-                        *z=work->axis[2][ap[2]][bp[2]][cp[2]];
-                Z v=0;
-                for (int root=0;root<n;++root) v+=x[root]*y[root]*z[root];
-                if (!isfinite(creal(v))||!isfinite(cimag(v))) return GPW_NUMERIC;
-                for (int ca=0;ca<a->nc;++ca) for (int cb=0;cb<b->nc;++cb)
-                    for (int cc=0;cc<(c?c->nc:1);++cc) {
-                        double coeff=a->coeffs[(size_t)ca*a->np+ia]*b->coeffs[(size_t)cb*b->np+ib]*
-                                     (c?c->coeffs[(size_t)cc*c->np+ic]:1.);
-                        size_t index=(((size_t)ca*a->nf+i)*nb+(size_t)cb*b->nf+j)*nc+(size_t)cc*fc+h;
-                        work->a[index]+=coeff*v;
+    /* Contract one shell at a time, as in CINT2e_loop. Single contractions
+     * alias the next stage and put their coefficients in the primitive prefactor. */
+    Z *ab=cc_count==1?work->a:work->c;
+    Z *av=b->nc==1?ab:work->b;
+    for (int ic=0;ic<(c?c->np:1);++ic) {
+        double cf=c&&cc_count==1?c->coeffs[ic]:1.;
+        if (cf==0.) continue;
+        if (cc_count>1) memset(ab,0,na*nb*fc*sizeof(Z));
+        for (int ib=0;ib<b->np;++ib) {
+            double bf=b->nc==1?b->coeffs[ib]:1.;
+            if (bf==0.) continue;
+            if (b->nc>1) memset(av,0,na*b->nf*fc*sizeof(Z));
+            for (int ia=0;ia<a->np;++ia) {
+                double af=a->nc==1?a->coeffs[ia]:1.;
+                if (af==0.) continue;
+                const PrimitiveData *params=work->params+((size_t)ic*b->np+ib)*a->np+ia;
+                int status=primitive(work,a,b,c,params,k,kp,af*bf*cf);
+                if (status) return status;
+                for (int i=0;i<a->nf;++i) for (int j=0;j<b->nf;++j) for (int h=0;h<fc;++h) {
+                    const int zero[3]={0};
+                    const int *ap=a->powers[i], *bp=b->powers[j], *cp=c?c->powers[h]:zero;
+                    const Z *x=work->axis[0][ap[0]][bp[0]][cp[0]],
+                            *y=work->axis[1][ap[1]][bp[1]][cp[1]],
+                            *z=work->axis[2][ap[2]][bp[2]][cp[2]];
+                    Z v=x[0]*y[0]*z[0];
+                    if (n==2) v+=x[1]*y[1]*z[1];
+                    else if (n>2) for (int root=1;root<n;++root) v+=x[root]*y[root]*z[root];
+                    if (!isfinite(creal(v))||!isfinite(cimag(v))) return GPW_NUMERIC;
+                    for (int ca=0;ca<a->nc;++ca) {
+                        double coeff=a->nc==1?1.:a->coeffs[(size_t)ca*a->np+ia];
+                        if (coeff!=0.) av[(((size_t)ca*a->nf+i)*b->nf+j)*fc+h]+=coeff*v;
                     }
+                }
+            }
+            if (b->nc>1) for (size_t ai=0;ai<na;++ai) for (int cb=0;cb<b->nc;++cb) {
+                double coeff=b->coeffs[(size_t)cb*b->np+ib];
+                if (coeff==0.) continue;
+                Z *dst=ab+(ai*nb+cb*b->nf)*fc;
+                const Z *src=av+ai*b->nf*fc;
+                for (int j=0;j<b->nf*fc;++j) dst[j]+=coeff*src[j];
             }
         }
+        if (cc_count>1) for (size_t ij=0;ij<na*nb;++ij) for (int cc=0;cc<cc_count;++cc) {
+            double coeff=c->coeffs[(size_t)cc*c->np+ic];
+            if (coeff==0.) continue;
+            for (int h=0;h<fc;++h) work->a[(ij*cc_count+cc)*fc+h]+=coeff*ab[ij*fc+h];
+        }
+    }
     return 0;
 }
 
@@ -218,12 +298,14 @@ static Z *spherical(GPWWorkspace *work,const Shell **ss,int rank,size_t *dims) {
         for (int i=axis+1;i<rank;++i) inner*=dims[i];
         const int ns=2*s->l+1;
         const size_t newdim=(size_t)ns*s->nc,old=dims[axis];
+        memset(dst,0,outer*newdim*inner*sizeof(Z));
         for (size_t o=0;o<outer;++o) for (int ctr=0;ctr<s->nc;++ctr)
-            for (int h=0;h<ns;++h) for (size_t j=0;j<inner;++j) {
-                Z value=0;
-                for (int c=0;c<s->nf;++c)
-                    value+=s->c2s[c*ns+h]*src[(o*old+(size_t)ctr*s->nf+c)*inner+j];
-                dst[(o*newdim+(size_t)ctr*ns+h)*inner+j]=value;
+            for (int h=0;h<ns;++h) for (int c=0;c<s->nf;++c) {
+                double coeff=s->c2s[c*ns+h];
+                if (coeff==0.) continue;
+                const Z *from=src+(o*old+(size_t)ctr*s->nf+c)*inner;
+                Z *to=dst+(o*newdim+(size_t)ctr*ns+h)*inner;
+                for (size_t j=0;j<inner;++j) to[j]+=coeff*from[j];
             }
         dims[axis]=newdim;
         Z *tmp=src; src=dst; dst=tmp;
@@ -283,6 +365,10 @@ static int integral_batch(double *out,size_t capacity,int32_t kind,int32_t op,in
         work=owned;
     }
     if (work->capacity<cartblock) { gpw_workspace_destroy(owned); return GPW_WORKSPACE; }
+    if (kind>1) {
+        status=prepare_primitives(work,ss[0],ss[1],kind==3?ss[2]:NULL);
+        if (status) { memset(out,0,outbytes); gpw_workspace_destroy(owned); return status; }
+    }
     for (size_t ik=0;ik<count;++ik) {
         status=kind==1?gpw_one_electron(work,ss[0],k+3*ik,op,atoms,natm,env):
             shell_integral(work,ss[0],ss[1],kind==3?ss[2]:NULL,k+3*ik,kind==2?kp+3*ik:NULL);
