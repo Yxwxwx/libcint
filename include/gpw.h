@@ -27,8 +27,10 @@ GPW_API const char *gpw_error_string(int status);
 GPW_API int gpw_opt_create(GPWOpt **opt, const int32_t *atm, int32_t natm,
     const int32_t *bas, int32_t nbas, const double *env, size_t nenv);
 GPW_API void gpw_opt_destroy(GPWOpt *opt);
-/* Capacity is in complex Cartesian shell elements; each call needs two buffers.
- * A workspace belongs to one concurrent caller; an opt is immutable/shareable. */
+/* Capacity is in complex Cartesian shell elements; each call needs three buffers.
+ * A workspace belongs to one concurrent caller; an opt is immutable/shareable.
+ * Parallel batches allocate private scratch per worker; workspace_bytes reports
+ * only the caller's persistent allocation, not temporary worker allocations. */
 GPW_API int gpw_workspace_create(GPWWorkspace **work, size_t capacity);
 GPW_API void gpw_workspace_destroy(GPWWorkspace *work);
 GPW_API size_t gpw_workspace_bytes(const GPWWorkspace *work);
@@ -91,6 +93,8 @@ GPW_API int gpw_int2e_gppg_sph(double *out_ri, size_t out_ncomplex,
 
 /* shls has `kind` real GTO indices. k/kp are flat (count,3), zip paired.
  * cart is 1 or 0. count=0 is valid. No MD fallback exists in this library.
+ * OpenMP builds parallelize independent k points using OMP_NUM_THREADS, with
+ * at most count workers; calls inside an active OpenMP region stay serial.
  * Validation failures leave output untouched. A failure after calculation
  * starts clears the entire requested output; the negative status is mandatory
  * to check. A failed batch never exposes partially computed integrals. */

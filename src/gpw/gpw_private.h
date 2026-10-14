@@ -11,6 +11,8 @@ typedef double complex Z;
 #define GPW_PI 3.141592653589793238462643383279502884
 #define GPW_MAXROOTS 10
 #define GPW_MAXPOINTS 4096
+#define GPW_LANES 8
+typedef struct { Z nodes[2],weights[2]; } GPWLowRule;
 typedef struct {
     int l,np,nc,nf;
     double center[3],sp;
@@ -29,11 +31,15 @@ struct GPWWorkspace {
     Z *a,*b,*c;
     PrimitiveData *params;
     size_t param_capacity;
+    GPWLowRule *tile;
+    size_t tile_capacity;
+    int tile_lane;
     Z axis[3][7][13][7][10];
     uint64_t rules,special;
 };
 
 int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual);
+int gpw_low_rules(int n,const Z *t,int count,GPWLowRule *rules);
 int gpw_nuclei_check(const int32_t *atoms,int32_t natm,const double *env,size_t nenv);
 int gpw_one_electron(GPWWorkspace *work,const Shell *a,const double *k,int op,
                      const int32_t *atoms,int32_t natm,const double *env);

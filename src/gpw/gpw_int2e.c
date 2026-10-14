@@ -1,6 +1,9 @@
 #include "gpw_private.h"
 #include "cint.h"
 #include <limits.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 typedef char gpw_requires_int32_fint[(sizeof(FINT)==sizeof(int32_t))?1:-1];
 
@@ -125,13 +128,15 @@ int gpw_workspace_create(GPWWorkspace **out,size_t capacity) {
     if (!w->a) { free(w); return GPW_MEMORY; }
     w->b=w->a+capacity; w->c=w->b+capacity; w->capacity=capacity;
     w->params=NULL; w->param_capacity=0;
+    w->tile=NULL; w->tile_capacity=0; w->tile_lane=-1;
     w->rules=0; w->special=0;
     *out=w;
     return 0;
 }
-void gpw_workspace_destroy(GPWWorkspace *w) { if (w) { free(w->params); free(w->a); free(w); } }
+void gpw_workspace_destroy(GPWWorkspace *w) { if (w) { free(w->tile); free(w->params); free(w->a); free(w); } }
 size_t gpw_workspace_bytes(const GPWWorkspace *w) {
-    return w?sizeof(*w)+w->capacity*3*sizeof(Z)+w->param_capacity*sizeof(PrimitiveData):0;
+    return w?sizeof(*w)+w->capacity*3*sizeof(Z)+w->param_capacity*sizeof(PrimitiveData)+
+        w->tile_capacity*sizeof(GPWLowRule):0;
 }
 uint64_t gpw_workspace_rules(const GPWWorkspace *w) { return w?w->rules:0; }
 uint64_t gpw_workspace_special(const GPWWorkspace *w) { return w?w->special:0; }
@@ -183,25 +188,40 @@ static inline void axis_recurrence(Z g[7][13][7][10],int root,int la,int lb,int 
 #undef G
 }
 
-static int primitive(GPWWorkspace *work,const Shell *a,const Shell *b,const Shell *c,
-                     const PrimitiveData *v,const double *k,const double *kp,double coeff) {
-    const int lc=c?c->l:0, n=(a->l+b->l+lc)/2+1;
-    Z P[3],Q[3],D[3],t=0,phase=v->phase;
+static Z primitive_argument(const Shell *a,const Shell *b,const Shell *c,
+                            const PrimitiveData *v,const double *k,const double *kp,
+                            Z P[3],Z Q[3],Z D[3],Z *phase) {
+    Z t=0;
+    *phase=v->phase;
     for (int d=0;d<3;++d) {
         P[d]=a->center[d]+I*k[d]*v->inv2p;
-        phase+=I*k[d]*a->center[d]-k[d]*k[d]*(.5*v->inv2p);
+        *phase+=I*k[d]*a->center[d]-k[d]*k[d]*(.5*v->inv2p);
         Q[d]=v->center[d];
         if (!c) {
             Q[d]-=I*kp[d]*v->inv2q;
-            phase-=I*kp[d]*b->center[d]+kp[d]*kp[d]*(.5*v->inv2q);
+            *phase-=I*kp[d]*b->center[d]+kp[d]*kp[d]*(.5*v->inv2q);
         }
         D[d]=P[d]-Q[d]; t+=v->rho*D[d]*D[d];
     }
-    Z s[10],weights[10]; double residual;
-    int status=gpw_rule(n,t,s,weights,&residual);
-    work->rules++;
-    if (fabs(creal(t))>20||fabs(cimag(t))>12) work->special++;
-    if (status) return status;
+    return t;
+}
+
+static int primitive(GPWWorkspace *work,const Shell *a,const Shell *b,const Shell *c,
+                     const PrimitiveData *v,const double *k,const double *kp,double coeff) {
+    const int lc=c?c->l:0, n=(a->l+b->l+lc)/2+1;
+    Z P[3],Q[3],D[3],phase;
+    Z t=primitive_argument(a,b,c,v,k,kp,P,Q,D,&phase);
+    Z local_s[10],local_w[10]; const Z *s=local_s,*weights=local_w;
+    if (work->tile_lane>=0) {
+        const GPWLowRule *rule=work->tile+(v-work->params)*GPW_LANES+work->tile_lane;
+        s=rule->nodes; weights=rule->weights;
+    } else {
+        double residual;
+        int status=gpw_rule(n,t,local_s,local_w,&residual);
+        work->rules++;
+        if (fabs(creal(t))>20||fabs(cimag(t))>12) work->special++;
+        if (status) return status;
+    }
     Z pref=v->pref*cexp(phase-fmin(creal(t),0.))*coeff;
     for (int root=0;root<n;++root) {
         Z va=(1-v->qfrac*s[root])*v->inv2p, vb=(1-v->pfrac*s[root])*v->inv2q;
@@ -225,6 +245,40 @@ static int primitive(GPWWorkspace *work,const Shell *a,const Shell *b,const Shel
             } else { AXIS(a->l,b->l,lc); }
 #undef LOW
 #undef AXIS
+        }
+    }
+    return 0;
+}
+
+static int prepare_rules(GPWWorkspace *work,const Shell *a,const Shell *b,const Shell *c,
+                         const double *k,const double *kp,int count) {
+    size_t size,bytes;
+    if (multiply(a->np,b->np,&size)||multiply(size,c?c->np:1,&size)||
+        multiply(size,GPW_LANES,&size)||multiply(size,sizeof(GPWLowRule),&bytes)) return GPW_RANGE;
+    if (size>work->tile_capacity) {
+        GPWLowRule *tile=realloc(work->tile,bytes);
+        if (!tile) return GPW_MEMORY;
+        work->tile=tile; work->tile_capacity=size;
+    }
+    const int n=(a->l+b->l+(c?c->l:0))/2+1;
+    for (int ic=0;ic<(c?c->np:1);++ic) {
+        if (c && c->nc==1 && c->coeffs[ic]==0.) continue;
+        for (int ib=0;ib<b->np;++ib) {
+            if (b->nc==1 && b->coeffs[ib]==0.) continue;
+            for (int ia=0;ia<a->np;++ia) {
+                if (a->nc==1 && a->coeffs[ia]==0.) continue;
+                size_t index=((size_t)ic*b->np+ib)*a->np+ia;
+                Z t[GPW_LANES];
+                for (int lane=0;lane<count;++lane) {
+                    Z P[3],Q[3],D[3],phase;
+                    t[lane]=primitive_argument(a,b,c,work->params+index,k+3*lane,
+                                               kp?kp+3*lane:NULL,P,Q,D,&phase);
+                    work->rules++;
+                    if (fabs(creal(t[lane]))>20||fabs(cimag(t[lane]))>12) work->special++;
+                }
+                int status=gpw_low_rules(n,t,count,work->tile+index*GPW_LANES);
+                if (status) return status;
+            }
         }
     }
     return 0;
@@ -334,7 +388,7 @@ static int integral_batch(double *out,size_t capacity,int32_t kind,int32_t op,in
         memcmp(opt->basis,basis,(size_t)nbas*8*sizeof(int32_t))||memcmp(opt->env,env,nenv*sizeof(double))))
         return GPW_STALE_OPT;
     Shell local[3]; const Shell *ss[3];
-    size_t block=1,cartblock=1,dims[3];
+    size_t block=1,cartblock=1;
     for (int i=0;i<kind;++i) {
         if (shls[i]<0||shls[i]>=nbas) return GPW_INPUT;
         if (opt) ss[i]=opt->shells+shls[i];
@@ -343,8 +397,7 @@ static int integral_batch(double *out,size_t capacity,int32_t kind,int32_t op,in
             if (status) return status;
             ss[i]=local+i;
         }
-        dims[i]=(size_t)ss[i]->nf*ss[i]->nc;
-        if (multiply(cartblock,dims[i],&cartblock)||
+        if (multiply(cartblock,(size_t)ss[i]->nf*ss[i]->nc,&cartblock)||
             multiply(block,(size_t)(cart?ss[i]->nf:2*ss[i]->l+1)*ss[i]->nc,&block)) return GPW_RANGE;
     }
     size_t required;
@@ -368,19 +421,65 @@ static int integral_batch(double *out,size_t capacity,int32_t kind,int32_t op,in
     if (kind>1) {
         status=prepare_primitives(work,ss[0],ss[1],kind==3?ss[2]:NULL);
         if (status) { memset(out,0,outbytes); gpw_workspace_destroy(owned); return status; }
+
     }
-    for (size_t ik=0;ik<count;++ik) {
-        status=kind==1?gpw_one_electron(work,ss[0],k+3*ik,op,atoms,natm,env):
-            shell_integral(work,ss[0],ss[1],kind==3?ss[2]:NULL,k+3*ik,kind==2?kp+3*ik:NULL);
-        if (status) break;
-        for (int i=0;i<kind;++i) dims[i]=(size_t)ss[i]->nf*ss[i]->nc;
-        Z *value=cart?work->a:spherical(work,ss,kind,dims);
-        for (size_t i=0;i<block;++i) {
-            if (!isfinite(creal(value[i]))||!isfinite(cimag(value[i]))) { status=GPW_NUMERIC; break; }
-            out[2*(ik*block+i)]=creal(value[i]); out[2*(ik*block+i)+1]=cimag(value[i]);
+    uint64_t rules=0,special=0,old_rules=work->rules,old_special=work->special;
+    int lanes=kind>1 && count>1 && ss[0]->l+ss[1]->l+(kind==3?ss[2]->l:0)<=3?GPW_LANES:1;
+#ifdef _OPENMP
+    int threads=omp_in_parallel()?1:omp_get_max_threads();
+    size_t tiles=(count-1)/lanes+1;
+    if (tiles<(size_t)threads) threads=(int)tiles;
+#pragma omp parallel if(threads>1) num_threads(threads) reduction(min:status) reduction(+:rules,special)
+#endif
+    {
+        GPWWorkspace *scratch=work;
+        int local_status=0;
+#ifdef _OPENMP
+        if (omp_get_thread_num()!=0) {
+            local_status=gpw_workspace_create(&scratch,cartblock);
+            /* Only the prepared primitive table is shared; all scratch is private. */
+            if (!local_status) scratch->params=work->params;
         }
-        if (status) break;
+#endif
+        uint64_t before_rules=scratch?scratch->rules:0,before_special=scratch?scratch->special:0;
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+        for (size_t first=0;first<count;first+=lanes) {
+            if (local_status) continue;
+            int used=count-first<(size_t)lanes?(int)(count-first):lanes;
+            if (lanes>1) {
+                local_status=prepare_rules(scratch,ss[0],ss[1],kind==3?ss[2]:NULL,
+                                           k+3*first,kind==2?kp+3*first:NULL,used);
+                if (local_status) continue;
+            }
+            for (int lane=0;lane<used;++lane) {
+                size_t ik=first+lane;
+                scratch->tile_lane=lanes>1?lane:-1;
+                local_status=kind==1?gpw_one_electron(scratch,ss[0],k+3*ik,op,atoms,natm,env):
+                    shell_integral(scratch,ss[0],ss[1],kind==3?ss[2]:NULL,k+3*ik,kind==2?kp+3*ik:NULL);
+                if (local_status) break;
+                size_t dims[3];
+                for (int i=0;i<kind;++i) dims[i]=(size_t)ss[i]->nf*ss[i]->nc;
+                Z *value=cart?scratch->a:spherical(scratch,ss,kind,dims);
+                for (size_t i=0;i<block;++i) {
+                    if (!isfinite(creal(value[i]))||!isfinite(cimag(value[i]))) { local_status=GPW_NUMERIC; break; }
+                    out[2*(ik*block+i)]=creal(value[i]); out[2*(ik*block+i)+1]=cimag(value[i]);
+                }
+                if (local_status) break;
+            }
+            scratch->tile_lane=-1;
+        }
+        if (local_status<status) status=local_status;
+        if (scratch) {
+            rules+=scratch->rules-before_rules; special+=scratch->special-before_special;
+            if (scratch!=work) {
+                scratch->params=NULL;
+                gpw_workspace_destroy(scratch);
+            }
+        }
     }
+    work->rules=old_rules+rules; work->special=old_special+special;
     if (status) memset(out,0,outbytes);
     gpw_workspace_destroy(owned);
     return status;

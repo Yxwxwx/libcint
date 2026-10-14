@@ -19,6 +19,8 @@ Common keyword arguments for the five integral functions:
 
 The bindings match libcint/include/gpw.h, ABI 1. The second plane wave in
 gppg is conjugated internally; pass its actual wavevector.
+OpenMP builds parallelize native k batches; set OMP_NUM_THREADS before starting
+Python to control the thread count. Each call owns its workspace.
 """
 import ctypes as ct
 from functools import lru_cache
@@ -270,7 +272,11 @@ def _evaluate(kind, mol, k, kp=None, *, shls=None, cart=None,
         selected = [tuple(int(s) for s in shls)]
         shape = tuple(int(sizes[s]) for s in shls)
     else:
-        selected = itertools.product(range(len(bas)), repeat=rank)
+        if rank == 3:
+            selected = ((a, b, c) for a in range(len(bas))
+                        for b in range(len(bas)) for c in range(b+1))
+        else:
+            selected = itertools.product(range(len(bas)), repeat=rank)
         shape = (int(sizes.sum()),)*rank
     scale = _normalization(waves, pw_norm, volume)
     if other is not None:
@@ -299,7 +305,11 @@ def _evaluate(kind, mol, k, kp=None, *, shls=None, cart=None,
                     double_pointer(waves), double_pointer(other), len(waves), *args, handle, workspace)
             check(status, f'{kind}, shls={shell}')
             if shls is None:
-                out[(slice(None),) + tuple(slice(loc[s], loc[s+1]) for s in shell)] = block
+                slices = tuple(slice(loc[s], loc[s+1]) for s in shell)
+                out[(slice(None),) + slices] = block
+                if rank == 3 and shell[1] != shell[2]:
+                    # Real GTO products commute on electron 2: no conjugation.
+                    out[:, slices[0], slices[2], slices[1]] = block.swapaxes(-1, -2)
             else:
                 out[...] = block
     finally:
@@ -361,6 +371,9 @@ def nuc(mol, k, **kwargs):
 
 def gpgg(mol, k, **kwargs):
     """Compute the chemists' two-electron integral ``(G_a P_k|G_b G_c)``.
+
+    Full AO assembly reuses b/c symmetry without conjugation and returns the
+    full tensor. Explicit ``shls`` evaluates exactly the requested block.
 
     Args:
         mol: PySCF Mole containing the Gaussian AO basis.

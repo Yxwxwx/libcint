@@ -17,6 +17,7 @@ cmake -S . -B build -DWITH_GPW=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
 python -m pip install ./python
 export GPW_LIBRARY="$PWD/build/libgpw.so"
+export OMP_NUM_THREADS=8
 python examples/gpw_pyscf.py
 ```
 
@@ -61,7 +62,77 @@ have separate workspaces. Wavevector-independent primitive data is prepared
 once per shell batch. General contractions accumulate one shell at a time;
 single contractions share buffers and combine their coefficients with the
 primitive prefactor. Workspaces hold three Cartesian buffers and a reusable
-primitive-parameter table; `gpw_workspace_bytes` includes both.
+primitive-parameter table. One/two-root two-electron batches also reuse a
+per-primitive, eight-k root tile; `gpw_workspace_bytes` includes this storage.
+
+OpenMP is enabled for `libgpw` when available; configure with
+`-DGPW_WITH_OPENMP=OFF` for a serial build. It adds no BLAS/LAPACK dependency
+and does not change the ordinary `libcint` target. Set `OMP_NUM_THREADS` before
+starting Python (or use `omp_set_num_threads` from a C application). All five
+integral types parallelize independent k points, using at most `nk` workers.
+Calls inside an already active OpenMP region stay serial. For callers using
+multiple processes, set the per-process thread count within the CPU allocation.
+
+Each worker has private recurrence, contraction and spherical-transform
+buffers. The prepared primitive table and opt are shared read-only. Worker
+scratch is allocated per shell batch and freed before returning; it is not
+included in the caller's `gpw_workspace_bytes`. Diagnostic counters include
+all workers. Each integral keeps its serial accumulation order and numerical
+checks; a calculation failure clears the full output after all workers finish.
+`OMP_WAIT_POLICY=PASSIVE` can avoid workers spinning between Python shell calls.
+
+One/two-root two-electron batches schedule eight-k tiles. Within the existing
+complex `|T| < 2` series domain, moment evaluation uses real/imaginary arrays
+and OpenMP SIMD across k, without combining sums from different k points.
+Scalar and SIMD paths share the root reconstruction and residual checks.
+Real nonnegative T still uses libcint's native Rys routine; other domains keep
+the established complex construction and its long-double safeguards. Known
+positive quadrature amplitudes supply weight moduli directly, avoiding
+redundant long-double complex absolute values. These choices depend on root
+count and numerical domain, never on molecular identity.
+
+The default build remains portable. On the deployment machine, the existing
+`-DBUILD_MARCH_NATIVE=ON` option enables its wider SIMD instructions. The
+benchmarked native build also uses `-DCMAKE_C_FLAGS=-ffp-contract=off` to avoid
+FMA changing accumulation rounding; it does not enable fast-math. Native
+binaries must not be moved to machines lacking those CPU instructions.
+
+Full-AO Python `gpgg` computes only shell pairs `b >= c` and fills the other
+half using `(G_a P_k|G_b G_c) = (G_a P_k|G_c G_b)` without conjugation. The
+returned tensor is still full-sized; diagonal shell blocks are evaluated in
+full. Explicit `shls` calls compute exactly the requested block. This symmetry
+is not applied to `gppg` with general paired wavevectors.
+
+## Workload and optimization target
+
+The primary workload is a small Gaussian AO basis with many plane-wave k
+points, potentially of order 100,000 or more. Small AO count does not restrict
+angular momentum or contraction patterns. The current deliverable remains the
+complete `gpgg` tensor `(nk, nao, nao, nao)`, including symmetry-related entries.
+Internal k tiling may organize its evaluation, but an MO-only result, a direct
+contraction, or a packed tensor does not replace that output requirement.
+
+Optimization should prioritize the work repeated for each k: complex Rys
+roots/weights, recurrence, root summation, contraction, spherical transformation
+and writing the full tensor. Opt preparation and allocation improvements are
+supporting measures; their importance must be measured on this workload.
+
+Use libcint's existing Rys implementation as the engineering reference:
+
+- `src/rys_roots.c`: root-count specialization and parameter-domain dispatch.
+  Reuse its real nonnegative-T routines where valid; complex-T fast paths
+  require their own stability analysis and independent numerical validation.
+- `src/g2e.c`: shell-dependent compact recurrence dimensions, recurrence-base
+  selection, precomputed Cartesian indices and unrolled low-order kernels.
+- `src/cint2e.c`: root-count-specialized `CINTgout2e`, staged contraction,
+  single-contraction buffer aliasing and exact-zero coefficient handling.
+
+GPW already uses some of these ideas; further work should measure the remaining
+gaps and adapt the same structure to complex arithmetic and batches of k.
+Across-k SIMD is a GPW-specific extension of this approach. Preserve supported
+inputs, numerical checks and error tolerances; use no molecule-specific tuning
+or unvalidated screening. Benchmark the complete returned tensor and validate
+all entries, separating kernel throughput from preparation and output costs.
 
 ## Definitions and normalization
 
@@ -158,6 +229,26 @@ Root reconstruction checks do not provide a uniform bound on discretization erro
 the independent checks below establish accuracy at their tested inputs.
 
 ## Validation
+
+The Python regression for OpenMP and symmetry can also be run independently:
+
+```sh
+OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1 python testsuite/test_gpw_parallel.py \
+  --library build/libgpw.so --report build/gpw_parallel_validation.json
+```
+
+It compares 1/2/4/8 threads, full tensors against independently evaluated shell
+blocks, all five operators, Cartesian/spherical AOs, general contractions,
+high angular momentum, empty/single/batched wavevectors, workspaces, counters
+and failure handling. For a build without OpenMP, add `--serial`; an older
+library may be supplied with `--reference` to check numerical compatibility.
+The regression also checks SIMD tile boundaries and mixed Rys parameter domains.
+An independent check of all ten root counts against 80-digit moments is:
+
+```sh
+python testsuite/test_gpw_roots.py --library build/libgpw.so \
+  --report build/gpw_roots_validation.json
+```
 
 ```sh
 cmake -S . -B build -DWITH_GPW=ON -DENABLE_TEST=ON \

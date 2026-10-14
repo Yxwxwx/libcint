@@ -6,7 +6,7 @@
 #include "gpw_legendre.h"
 #include "rys_roots.h"
 
-typedef struct { int n; double y[GPW_MAXPOINTS]; Z w[GPW_MAXPOINTS];
+typedef struct { int n; double y[GPW_MAXPOINTS],amplitude[GPW_MAXPOINTS]; Z w[GPW_MAXPOINTS];
                  double offset, factor; } Measure;
 
 /* Extra precision only inside the complex rule construction; the ABI stays double. */
@@ -42,7 +42,10 @@ static int measure(Z t,Measure *m) {
                 double v=lo+width*gpw_gl_x[j], s=v*v;
                 int i=m->n++;
                 m->y[i]=(s-m->offset)/m->factor;
-                m->w[i]=width*gpw_gl_w[j]*cexp(scale-t*s);
+                double amplitude=width*gpw_gl_w[j]*exp(scale-a*s);
+                m->w[i]=amplitude*(cos(b*s)-I*sin(b*s));
+                /* The modulus is known before applying the unit complex phase. */
+                m->amplitude[i]=amplitude;
             }
         }
     }
@@ -127,6 +130,36 @@ static int eigenvalues(int n,const LZ *alpha,const LZ *beta,LZ *roots) {
     return GPW_SUCCESS;
 }
 
+static int small_roots(int n,const Z *moments,Z *nodes,Z *weights,double *residual) {
+    if (cabs(moments[0])<DBL_MIN) return GPW_NUMERIC;
+    if (n==1) { nodes[0]=moments[1]/moments[0]; weights[0]=moments[0]; }
+    else {
+        Z a=moments[1]/moments[0];
+        Z norm=moments[2]-2.*a*moments[1]+a*a*moments[0];
+        if (cabs(norm)<1e-14*cabs(moments[0])) return GPW_NUMERIC;
+        Z b=(moments[3]-2.*a*moments[2]+a*a*moments[1])/norm;
+        Z delta=csqrt((a-b)*(a-b)+4.*norm/moments[0]);
+        if (cabs(delta)<1e-14) return GPW_NUMERIC;
+        nodes[0]=(a+b+delta)*.5; nodes[1]=(a+b-delta)*.5;
+        weights[0]=(moments[1]-nodes[1]*moments[0])/delta;
+        weights[1]=moments[0]-weights[0];
+    }
+    double worst=0;
+    Z powers[2]={1.,1.};
+    for (int m=0;m<2*n;++m) {
+        Z v=0;
+        for (int i=0;i<n;++i) {
+            v+=weights[i]*powers[i];
+            powers[i]*=nodes[i];
+        }
+        double err=cabs(v-moments[m])/(cabs(moments[m])+DBL_MIN);
+        if (!isfinite(err)) return GPW_NUMERIC;
+        worst=fmax(worst,err);
+    }
+    *residual=worst;
+    return worst<2e-12?0:GPW_NUMERIC;
+}
+
 int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
     if (n<1||n>10) return GPW_RANGE;
     if (!isfinite(creal(t))||!isfinite(cimag(t))) return GPW_INPUT;
@@ -161,33 +194,7 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
             term*=-t/(j+1.);
             if (cabs(term)<2e-17) break;
         }
-        if (cabs(moments[0])<DBL_MIN) return GPW_NUMERIC;
-        if (n==1) { nodes[0]=moments[1]/moments[0]; weights[0]=moments[0]; }
-        else {
-            Z a=moments[1]/moments[0];
-            Z norm=moments[2]-2.*a*moments[1]+a*a*moments[0];
-            if (cabs(norm)<1e-14*cabs(moments[0])) return GPW_NUMERIC;
-            Z b=(moments[3]-2.*a*moments[2]+a*a*moments[1])/norm;
-            Z delta=csqrt((a-b)*(a-b)+4.*norm/moments[0]);
-            if (cabs(delta)<1e-14) return GPW_NUMERIC;
-            nodes[0]=(a+b+delta)*.5; nodes[1]=(a+b-delta)*.5;
-            weights[0]=(moments[1]-nodes[1]*moments[0])/delta;
-            weights[1]=moments[0]-weights[0];
-        }
-        double worst=0;
-        Z powers[2]={1.,1.};
-        for (int m=0;m<2*n;++m) {
-            Z v=0;
-            for (int i=0;i<n;++i) {
-                v+=weights[i]*powers[i];
-                powers[i]*=nodes[i];
-            }
-            double err=cabs(v-moments[m])/(cabs(moments[m])+DBL_MIN);
-            if (!isfinite(err)) return GPW_NUMERIC;
-            worst=fmax(worst,err);
-        }
-        *residual=worst;
-        return worst<2e-12?0:GPW_NUMERIC;
+        return small_roots(n,moments,nodes,weights,residual);
     }
     Measure m;
     int status=measure(t,&m);
@@ -196,7 +203,7 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
         LZ f0=0,f1=0; long double bound0=0,bound1=0;
         for (int j=0;j<m.n;++j) {
             f0+=(LZ)m.w[j]; f1+=(LZ)m.w[j]*m.y[j];
-            long double amplitude=cabsl((LZ)m.w[j]);
+            long double amplitude=m.amplitude[j];
             bound0+=amplitude; bound1+=amplitude*fabs(m.y[j]);
         }
         if (!isfinite(bound0)||cabsl(f0)<DBL_MIN||cabsl(f0)<1e-13*bound0)
@@ -216,7 +223,7 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
         LZ f[4]={0},g[4],roots[2]; long double bounds[4]={0},amplitude=0;
         for (int j=0;j<m.n;++j) {
             LZ v=m.w[j];
-            long double magnitude=cabsl(v);
+            long double magnitude=m.amplitude[j];
             for (int k=0;k<4;++k) {
                 f[k]+=v; bounds[k]+=magnitude;
                 v*=m.y[j]; magnitude*=fabs(m.y[j]);
@@ -253,7 +260,7 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
     LZ p[GPW_MAXPOINTS],old[GPW_MAXPOINTS];
     long double absweight[GPW_MAXPOINTS];
     LZ alpha[10], beta[10]={0}, norms[10];
-    for (int j=0;j<m.n;++j) { p[j]=1; old[j]=0; absweight[j]=cabsl((LZ)m.w[j]); }
+    for (int j=0;j<m.n;++j) { p[j]=1; old[j]=0; absweight[j]=m.amplitude[j]; }
     long double absnorm=0;
     for (int k=0;k<n;++k) {
         LZ norm=0,first=0; absnorm=0;
@@ -306,6 +313,52 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
     }
     *residual=worst;
     return worst<2e-11?GPW_SUCCESS:GPW_NUMERIC;
+}
+
+/* Independent k lanes share the series order, never a floating-point reduction. */
+int gpw_low_rules(int n,const Z *t,int count,GPWLowRule *rules) {
+    double tr[GPW_LANES]={0},ti[GPW_LANES]={0},re[GPW_LANES]={0},im[GPW_LANES]={0};
+    double mr[4][GPW_LANES]={{0}},mi[4][GPW_LANES]={{0}};
+    int selected[GPW_LANES]={0},active[GPW_LANES]={0},remaining=0;
+    for (int k=0;k<count;++k) {
+        if (cabs(t[k])<2. && !(cimag(t[k])==0. && creal(t[k])>=0.)) {
+            selected[k]=active[k]=1; ++remaining;
+            tr[k]=creal(t[k]); ti[k]=cimag(t[k]); re[k]=exp(fmin(tr[k],0.));
+        } else {
+            double residual;
+            int status=gpw_rule(n,t[k],rules[k].nodes,rules[k].weights,&residual);
+            if (status) return status;
+        }
+    }
+    for (int j=0;j<50 && remaining;++j) {
+        for (int m=0;m<2*n;++m) {
+            double denominator=2*m+2.*j+1;
+#pragma omp simd
+            for (int k=0;k<GPW_LANES;++k) {
+                mr[m][k]+=re[k]/denominator;
+                mi[m][k]+=im[k]/denominator;
+            }
+        }
+        double denominator=j+1.;
+#pragma omp simd
+        for (int k=0;k<GPW_LANES;++k) {
+            double ar=-tr[k]/denominator,ai=-ti[k]/denominator;
+            double next=re[k]*ar-im[k]*ai;
+            im[k]=re[k]*ai+im[k]*ar;
+            re[k]=next;
+        }
+        /* |T|<2 bounds every series term; squaring cannot overflow here. */
+        for (int k=0;k<count;++k) if (active[k] && re[k]*re[k]+im[k]*im[k]<4e-34) {
+            active[k]=0; --remaining; re[k]=im[k]=0.;
+        }
+    }
+    for (int k=0;k<count;++k) if (selected[k]) {
+        Z moments[4]; double residual;
+        for (int m=0;m<2*n;++m) moments[m]=mr[m][k]+I*mi[m][k];
+        int status=small_roots(n,moments,rules[k].nodes,rules[k].weights,&residual);
+        if (status) return status;
+    }
+    return 0;
 }
 
 int gpw_rys_rule(int32_t n,double tr,double ti,double *nodes,double *weights,
