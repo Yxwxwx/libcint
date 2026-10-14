@@ -1,4 +1,4 @@
-"""Call all five GPW integral types from the libcint source checkout.
+"""Call all six GPW integral types from the libcint source checkout.
 
 Requires PySCF, NumPy, and a built libgpw shared library. Set GPW_LIBRARY
 to its absolute path if it is not installed or built in libcint/build.
@@ -28,6 +28,8 @@ with gpw.prepare(mol) as opt:
     overlap = gpw.ovlp(mol, k, opt=opt)    # <G_a|P_k>: (nk, nao)
     kinetic = gpw.kin(mol, k, opt=opt)    # <G_a|-∇²/2|P_k>: (nk, nao)
     nuclear = gpw.nuc(mol, k, opt=opt)    # <G_a|V_nuc|P_k>: (nk, nao)
+    dipole = gpw.dipole(mol, k, opt=opt)  # <G_a|r|P_k>: (nk, 3, nao), x/y/z, no -e
+    dipole_single = gpw.dipole(mol, k[0], opt=opt)  # (3, nao)
     gpgg = gpw.gpgg(mol, k, opt=opt)      # (G_a P_k|G_b G_c): (nk, nao, nao, nao)
     # k[i] pairs with kp[i]; the second plane wave is conjugated internally.
     gppg = gpw.gppg(mol, k, kp, opt=opt) # (G_a P_k|P_kp G_b): (nk, nao, nao)
@@ -38,6 +40,8 @@ with gpw.prepare(mol) as opt:
     gppg_all = gpw.gppg(mol, k_pairs, kp_pairs, opt=opt).reshape(len(k), len(k), nao, nao)
 
 assert overlap.shape == kinetic.shape == nuclear.shape == (len(k), nao)
+assert dipole.shape == (len(k), 3, nao)
+np.testing.assert_allclose(dipole_single, dipole[0])
 assert gpgg.shape == (len(k), nao, nao, nao)
 assert gppg.shape == (len(k), nao, nao)
 assert gppg_pair.shape == (nao, nao)
@@ -46,8 +50,14 @@ np.testing.assert_allclose(gppg_pair, gppg[0])
 np.testing.assert_allclose(gppg_pair, gppg_all[0, 1])
 np.testing.assert_allclose(kinetic, 0.5 * np.sum(k * k, axis=1)[:, None] * overlap)
 
+# Common origin is in bohr. Set it before preparing OPT; the operator has no -e.
+origin = np.array([0.2, -0.1, 0.3])
+with mol.with_common_orig(origin), gpw.prepare(mol) as opt:
+    shifted_dipole = gpw.dipole(mol, k, opt=opt)
+np.testing.assert_allclose(shifted_dipole, dipole-origin[None, :, None]*overlap[:, None, :])
+
 for name, value in (
-    ("ovlp", overlap), ("kin", kinetic), ("nuc", nuclear),
+    ("ovlp", overlap), ("kin", kinetic), ("nuc", nuclear), ("dipole", dipole),
     ("gpgg", gpgg), ("gppg", gppg),
     ("gppg(k[0], k[1])", gppg_pair), ("gppg(all pairs)", gppg_all),
 ):

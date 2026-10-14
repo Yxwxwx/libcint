@@ -19,7 +19,7 @@ int gpw_nuclei_check(const int32_t *atoms,int32_t natm,const double *env,size_t 
     return 0;
 }
 
-static void moments(Z m[7],int l,Z shift,Z variance) {
+static void moments(Z *m,int l,Z shift,Z variance) {
     m[0]=1;
     if (l) m[1]=shift;
     for (int j=2;j<=l;++j) m[j]=shift*m[j-1]+(j-1)*variance*m[j-2];
@@ -30,21 +30,31 @@ int gpw_one_electron(GPWWorkspace *work,const Shell *a,const double *k,int op,
     double k2=0,angle=0;
     for (int d=0;d<3;++d) { k2+=k[d]*k[d]; angle+=k[d]*a->center[d]; }
     if (!isfinite(k2)||!isfinite(angle)) return GPW_RANGE;
-    memset(work->a,0,(size_t)a->nf*a->nc*sizeof(Z));
+    const int ncomp=op==GPW_DIPOLE?3:1;
+    const size_t stride=(size_t)a->nf*a->nc;
+    memset(work->a,0,ncomp*stride*sizeof(Z));
     if (op==GPW_KIN && k2==0) return 0;
     for (int ip=0;ip<a->np;++ip) {
         const double p=a->exps[ip],x=k2/(4*p);
-        Z shift[3],value[28]={0};
+        Z shift[3],value[3][28]={{0}};
         for (int d=0;d<3;++d) shift[d]=I*(k[d]/p*.5);
         if (!isfinite(x)) return GPW_RANGE;
         if (op!=GPW_NUC) {
-            Z m[3][7];
-            for (int d=0;d<3;++d) moments(m[d],a->l,shift[d],.5/p);
+            Z m[3][8];
+            for (int d=0;d<3;++d) moments(m[d],a->l+(op==GPW_DIPOLE),shift[d],.5/p);
             Z pref=pow(GPW_PI/p,1.5)*cexp(-x+I*angle)*a->sp;
             if (op==GPW_KIN) pref*=.5*k2;
             for (int j=0;j<a->nf;++j) {
                 const int *l=a->powers[j];
-                value[j]=pref*m[0][l[0]]*m[1][l[1]]*m[2][l[2]];
+                if (op==GPW_DIPOLE) {
+                    for (int d=0;d<3;++d) {
+                        Z v=pref;
+                        for (int axis=0;axis<3;++axis)
+                            v*=axis==d?m[axis][l[axis]+1]+(a->center[axis]-env[PTR_COMMON_ORIG+axis])*m[axis][l[axis]]:
+                                      m[axis][l[axis]];
+                        value[d][j]=v;
+                    }
+                } else value[0][j]=pref*m[0][l[0]]*m[1][l[1]]*m[2][l[2]];
             }
         } else {
             const int n=a->l/2+1;
@@ -80,15 +90,15 @@ int gpw_one_electron(GPWWorkspace *work,const Shell *a,const double *k,int op,
                         moments(m[d],a->l,shift[d]-u*D[d],(1-u)*(.5/p));
                     for (int j=0;j<a->nf;++j) {
                         const int *l=a->powers[j];
-                        value[j]+=pref*w[root]*m[0][l[0]]*m[1][l[1]]*m[2][l[2]];
+                        value[0][j]+=pref*w[root]*m[0][l[0]]*m[1][l[1]]*m[2][l[2]];
                     }
                 }
             }
         }
-        for (int j=0;j<a->nf;++j) {
-            if (!isfinite(creal(value[j]))||!isfinite(cimag(value[j]))) return GPW_NUMERIC;
+        for (int d=0;d<ncomp;++d) for (int j=0;j<a->nf;++j) {
+            if (!isfinite(creal(value[d][j]))||!isfinite(cimag(value[d][j]))) return GPW_NUMERIC;
             for (int c=0;c<a->nc;++c)
-                work->a[(size_t)c*a->nf+j]+=a->coeffs[(size_t)c*a->np+ip]*value[j];
+                work->a[d*stride+(size_t)c*a->nf+j]+=a->coeffs[(size_t)c*a->np+ip]*value[d][j];
         }
     }
     return 0;

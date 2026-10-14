@@ -12,7 +12,7 @@ typedef double complex Z;
 #define GPW_MAXROOTS 10
 #define GPW_MAXPOINTS 4096
 #define GPW_LANES 8
-typedef struct { Z nodes[2],weights[2]; } GPWLowRule;
+typedef struct { Z nodes[2],weights[2],pref; } GPWLowRule;
 typedef struct {
     int l,np,nc,nf;
     double center[3],sp;

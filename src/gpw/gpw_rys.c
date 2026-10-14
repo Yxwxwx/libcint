@@ -5,6 +5,17 @@
 #include "gpw_private.h"
 #include "gpw_legendre.h"
 #include "rys_roots.h"
+#include "roots_for_x0.dat"
+
+#ifdef GPW_SIMD_MATH
+/* Enable the platform's vector ABI only after the build verifies its symbols. */
+#pragma omp declare simd notinbranch
+extern double exp(double);
+#pragma omp declare simd notinbranch
+extern double cos(double);
+#pragma omp declare simd notinbranch
+extern double sin(double);
+#endif
 
 typedef struct { int n; double y[GPW_MAXPOINTS],amplitude[GPW_MAXPOINTS]; Z w[GPW_MAXPOINTS];
                  double offset, factor; } Measure;
@@ -160,6 +171,75 @@ static int small_roots(int n,const Z *moments,Z *nodes,Z *weights,double *residu
     return worst<2e-12?0:GPW_NUMERIC;
 }
 
+static int measured_roots(int n,const LZ *f,const long double *bounds,
+                          double offset,double factor,Z *nodes,Z *weights,double *residual) {
+    if (n==1) {
+        if (!isfinite(bounds[0])||cabsl(f[0])<DBL_MIN||cabsl(f[0])<1e-13*bounds[0])
+            return GPW_NUMERIC;
+        LZ root=f[1]/f[0];
+        nodes[0]=offset+factor*root; weights[0]=f[0];
+        if (!isfinite(creal(nodes[0]))||!isfinite(cimag(nodes[0]))) return GPW_NUMERIC;
+        *residual=fmaxl(cabsl((LZ)weights[0]-f[0])/fmaxl(bounds[0],DBL_MIN),
+                        cabsl((LZ)weights[0]*root-f[1])/fmaxl(bounds[1],DBL_MIN));
+        return isfinite(*residual)&&*residual<2e-11?GPW_SUCCESS:GPW_NUMERIC;
+    }
+    /* The monic moment system stays stable near zeros of the zeroth moment. */
+    LZ g[4],roots[2]; long double amplitude=0;
+    for (int k=0;k<4;++k) amplitude=fmaxl(amplitude,cabsl(f[k]));
+    if (!(amplitude>DBL_MIN)||!isfinite(amplitude)) return GPW_NUMERIC;
+    for (int k=0;k<4;++k) g[k]=f[k]/amplitude;
+    LZ det=g[0]*g[2]-g[1]*g[1];
+    if (cabsl(det)<1e-13*(cabsl(g[0]*g[2])+cabsl(g[1]*g[1]))) return GPW_NUMERIC;
+    LZ c1=(g[1]*g[2]-g[0]*g[3])/det,c0=(g[1]*g[3]-g[2]*g[2])/det;
+    LZ disc=csqrtl(c1*c1-4*c0),plus=-c1+disc,minus=-c1-disc;
+    roots[0]=.5*(cabsl(plus)>cabsl(minus)?plus:minus);
+    if (cabsl(roots[0])<DBL_MIN) return GPW_NUMERIC;
+    roots[1]=c0/roots[0];
+    if (cabsl(roots[0]-roots[1])<1e-14*(1+cabsl(roots[0])+cabsl(roots[1]))) return GPW_NUMERIC;
+    weights[0]=(f[1]-roots[1]*f[0])/(roots[0]-roots[1]);
+    weights[1]=f[0]-weights[0];
+    for (int i=0;i<2;++i) {
+        nodes[i]=offset+factor*roots[i];
+        if (!isfinite(creal(nodes[i]))||!isfinite(cimag(nodes[i]))||
+            !isfinite(creal(weights[i]))||!isfinite(cimag(weights[i]))) return GPW_NUMERIC;
+    }
+    long double worst=0; LZ powers[2]={1,1};
+    for (int k=0;k<4;++k) {
+        long double err=cabsl(weights[0]*powers[0]+weights[1]*powers[1]-f[k])/fmaxl(bounds[k],DBL_MIN);
+        if (!isfinite(err)) return GPW_NUMERIC;
+        worst=fmaxl(worst,err);
+        for (int i=0;i<2;++i) powers[i]*=roots[i];
+    }
+    *residual=worst;
+    return worst<2e-11?GPW_SUCCESS:GPW_NUMERIC;
+}
+
+static int asymptotic_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
+    double a=creal(t),radius=cabs(t),m=2*n-1.;
+    if (!(a>40.)||!isfinite(radius)) return 1;
+    /* The omitted [1,infinity) tail is bounded by exp(-a)/(2*(a-m+.5)).
+     * For a>40 and n<=10, the highest moment gives the largest relative bound. */
+    double logbound=-a+(m+.5)*log(radius)-lgamma(m+.5)-log(a-m+.5);
+    if (logbound>log(4*DBL_EPSILON)) return 1;
+    int off=n*(n-1)/2;
+    Z pref=sqrt(GPW_PI)*.5/csqrt(t),powers[10],scaled[10];
+    for (int i=0;i<n;++i) {
+        nodes[i]=POLY_LARGEX_RT[off+i]/t;
+        weights[i]=POLY_LARGEX_WW[off+i]*pref;
+        scaled[i]=nodes[i]*t; powers[i]=1.;
+    }
+    double exact=1.,worst=0.;
+    for (int k=0;k<2*n;++k) {
+        Z sum=0;
+        for (int i=0;i<n;++i) { sum+=weights[i]/pref*powers[i]; powers[i]*=scaled[i]; }
+        double err=cabs(sum-exact)/exact;
+        if (!isfinite(err)) return 1;
+        worst=fmax(worst,err); exact*=k+.5;
+    }
+    *residual=worst+exp(logbound);
+    return *residual<2e-12?0:1;
+}
+
 int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
     if (n<1||n>10) return GPW_RANGE;
     if (!isfinite(creal(t))||!isfinite(cimag(t))) return GPW_INPUT;
@@ -184,6 +264,7 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
             if (worst<2e-12) { *residual=worst; return GPW_SUCCESS; }
         }
     }
+    if (asymptotic_rule(n,t,nodes,weights,residual)==0) return GPW_SUCCESS;
     /* Low-order analytic cases use a convergent small-|T| moment series.
      * This is a Rys rule, not an integral-backend fallback. Restrict the domain
      * to avoid cancellation of clustered high-|T| power moments. */
@@ -199,63 +280,16 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
     Measure m;
     int status=measure(t,&m);
     if (status) return status;
-    if (n==1) {
-        LZ f0=0,f1=0; long double bound0=0,bound1=0;
+    if (n<=2) {
+        LZ f[4]={0}; long double bounds[4]={0};
         for (int j=0;j<m.n;++j) {
-            f0+=(LZ)m.w[j]; f1+=(LZ)m.w[j]*m.y[j];
-            long double amplitude=m.amplitude[j];
-            bound0+=amplitude; bound1+=amplitude*fabs(m.y[j]);
-        }
-        if (!isfinite(bound0)||cabsl(f0)<DBL_MIN||cabsl(f0)<1e-13*bound0)
-            return GPW_NUMERIC;
-        LZ root=f1/f0;
-        nodes[0]=m.offset+m.factor*root; weights[0]=f0;
-        if (!isfinite(creal(nodes[0]))||!isfinite(cimag(nodes[0]))) return GPW_NUMERIC;
-        *residual=fmaxl(cabsl((LZ)weights[0]-f0)/fmaxl(bound0,DBL_MIN),
-                        cabsl((LZ)weights[0]*root-f1)/fmaxl(bound1,DBL_MIN));
-        return isfinite(*residual)&&*residual<2e-11?GPW_SUCCESS:GPW_NUMERIC;
-    }
-    if (n==2) {
-        /* Near a zero of the complex zeroth moment, the two Stieltjes
-         * diagonal entries become large and opposite. Form the monic
-         * polynomial directly from the 2x2 moment system to avoid that
-         * cancellation. This also avoids division by the zeroth moment. */
-        LZ f[4]={0},g[4],roots[2]; long double bounds[4]={0},amplitude=0;
-        for (int j=0;j<m.n;++j) {
-            LZ v=m.w[j];
-            long double magnitude=m.amplitude[j];
-            for (int k=0;k<4;++k) {
+            LZ v=m.w[j]; long double magnitude=m.amplitude[j];
+            for (int k=0;k<2*n;++k) {
                 f[k]+=v; bounds[k]+=magnitude;
                 v*=m.y[j]; magnitude*=fabs(m.y[j]);
             }
         }
-        for (int k=0;k<4;++k) amplitude=fmaxl(amplitude,cabsl(f[k]));
-        if (!(amplitude>DBL_MIN)||!isfinite(amplitude)) return GPW_NUMERIC;
-        for (int k=0;k<4;++k) g[k]=f[k]/amplitude;
-        LZ det=g[0]*g[2]-g[1]*g[1];
-        if (cabsl(det)<1e-13*(cabsl(g[0]*g[2])+cabsl(g[1]*g[1]))) return GPW_NUMERIC;
-        LZ c1=(g[1]*g[2]-g[0]*g[3])/det,c0=(g[1]*g[3]-g[2]*g[2])/det;
-        LZ disc=csqrtl(c1*c1-4*c0),plus=-c1+disc,minus=-c1-disc;
-        roots[0]=.5*(cabsl(plus)>cabsl(minus)?plus:minus);
-        if (cabsl(roots[0])<DBL_MIN) return GPW_NUMERIC;
-        roots[1]=c0/roots[0];
-        if (cabsl(roots[0]-roots[1])<1e-14*(1+cabsl(roots[0])+cabsl(roots[1]))) return GPW_NUMERIC;
-        weights[0]=(f[1]-roots[1]*f[0])/(roots[0]-roots[1]);
-        weights[1]=f[0]-weights[0];
-        for (int i=0;i<2;++i) {
-            nodes[i]=m.offset+m.factor*roots[i];
-            if (!isfinite(creal(nodes[i]))||!isfinite(cimag(nodes[i]))||
-                !isfinite(creal(weights[i]))||!isfinite(cimag(weights[i]))) return GPW_NUMERIC;
-        }
-        long double worst=0; LZ powers[2]={1,1};
-        for (int k=0;k<4;++k) {
-            long double err=cabsl(weights[0]*powers[0]+weights[1]*powers[1]-f[k])/fmaxl(bounds[k],DBL_MIN);
-            if (!isfinite(err)) return GPW_NUMERIC;
-            worst=fmaxl(worst,err);
-            for (int i=0;i<2;++i) powers[i]*=roots[i];
-        }
-        *residual=worst;
-        return worst<2e-11?GPW_SUCCESS:GPW_NUMERIC;
+        return measured_roots(n,f,bounds,m.offset,m.factor,nodes,weights,residual);
     }
     LZ p[GPW_MAXPOINTS],old[GPW_MAXPOINTS];
     long double absweight[GPW_MAXPOINTS];
@@ -315,15 +349,60 @@ int gpw_rule(int n,Z t,Z *nodes,Z *weights,double *residual) {
     return worst<2e-11?GPW_SUCCESS:GPW_NUMERIC;
 }
 
+static int medium_rules(int n,const Z *t,int count,const int *selected,GPWLowRule *rules) {
+    double tr[GPW_LANES]={0},ti[GPW_LANES]={0},scale[GPW_LANES]={0};
+    double mr[4][GPW_LANES]={{0}},mi[4][GPW_LANES]={{0}};
+    double cr[4][GPW_LANES]={{0}},ci[4][GPW_LANES]={{0}},bound[4][GPW_LANES]={{0}};
+    for (int k=0;k<count;++k) if (selected[k]==2) {
+        tr[k]=creal(t[k]); ti[k]=cimag(t[k]); scale[k]=fmin(tr[k],0.);
+    }
+    for (int j=0;j<32;++j) {
+        double s=gpw_gl_x[j]*gpw_gl_x[j],w=gpw_gl_w[j];
+        double re[GPW_LANES],im[GPW_LANES],amplitude[GPW_LANES];
+#pragma omp simd
+        for (int k=0;k<GPW_LANES;++k) {
+            double a=w*exp(scale[k]-tr[k]*s),angle=ti[k]*s;
+            re[k]=a*cos(angle); im[k]=-a*sin(angle); amplitude[k]=a;
+        }
+        for (int m=0;m<2*n;++m) {
+#pragma omp simd
+            for (int k=0;k<GPW_LANES;++k) {
+                /* Compensate each k independently; no reassociation/fast-math. */
+                double yr=re[k]-cr[m][k],yi=im[k]-ci[m][k];
+                double sr=mr[m][k]+yr,si=mi[m][k]+yi;
+                cr[m][k]=(sr-mr[m][k])-yr; ci[m][k]=(si-mi[m][k])-yi;
+                mr[m][k]=sr; mi[m][k]=si; bound[m][k]+=amplitude[k];
+                re[k]*=s; im[k]*=s; amplitude[k]*=s;
+            }
+        }
+    }
+    for (int k=0;k<count;++k) if (selected[k]==2) {
+        LZ f[4]; long double bounds[4]; double residual;
+        int stable=1;
+        for (int m=0;m<2*n;++m) {
+            f[m]=(LZ)mr[m][k]+I*(LZ)mi[m][k]; bounds[m]=bound[m][k];
+            /* Limit cancellation amplification to 1e3 for double moment sums. */
+            if (cabsl(f[m])<1e-3*bounds[m]) stable=0;
+        }
+        int status=stable?measured_roots(n,f,bounds,0.,1.,rules[k].nodes,rules[k].weights,&residual):GPW_NUMERIC;
+        if (status) status=gpw_rule(n,t[k],rules[k].nodes,rules[k].weights,&residual);
+        if (status) return status;
+    }
+    return 0;
+}
+
 /* Independent k lanes share the series order, never a floating-point reduction. */
 int gpw_low_rules(int n,const Z *t,int count,GPWLowRule *rules) {
     double tr[GPW_LANES]={0},ti[GPW_LANES]={0},re[GPW_LANES]={0},im[GPW_LANES]={0};
     double mr[4][GPW_LANES]={{0}},mi[4][GPW_LANES]={{0}};
-    int selected[GPW_LANES]={0},active[GPW_LANES]={0},remaining=0;
+    int selected[GPW_LANES]={0},active[GPW_LANES]={0},remaining=0,medium=0;
     for (int k=0;k<count;++k) {
         if (cabs(t[k])<2. && !(cimag(t[k])==0. && creal(t[k])>=0.)) {
             selected[k]=active[k]=1; ++remaining;
             tr[k]=creal(t[k]); ti[k]=cimag(t[k]); re[k]=exp(fmin(tr[k],0.));
+        } else if (fabs(creal(t[k]))<=20. && fabs(cimag(t[k]))<=12. &&
+                   !(cimag(t[k])==0. && creal(t[k])>=0.)) {
+            selected[k]=2; medium=1;
         } else {
             double residual;
             int status=gpw_rule(n,t[k],rules[k].nodes,rules[k].weights,&residual);
@@ -352,13 +431,13 @@ int gpw_low_rules(int n,const Z *t,int count,GPWLowRule *rules) {
             active[k]=0; --remaining; re[k]=im[k]=0.;
         }
     }
-    for (int k=0;k<count;++k) if (selected[k]) {
+    for (int k=0;k<count;++k) if (selected[k]==1) {
         Z moments[4]; double residual;
         for (int m=0;m<2*n;++m) moments[m]=mr[m][k]+I*mi[m][k];
         int status=small_roots(n,moments,rules[k].nodes,rules[k].weights,&residual);
         if (status) return status;
     }
-    return 0;
+    return medium?medium_rules(n,t,count,selected,rules):0;
 }
 
 int gpw_rys_rule(int32_t n,double tr,double ti,double *nodes,double *weights,

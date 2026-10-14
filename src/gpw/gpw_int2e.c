@@ -188,20 +188,27 @@ static inline void axis_recurrence(Z g[7][13][7][10],int root,int la,int lb,int 
 #undef G
 }
 
+static void primitive_centers(const Shell *a,const Shell *c,const PrimitiveData *v,
+                              const double *k,const double *kp,Z P[3],Z Q[3],Z D[3]) {
+    for (int d=0;d<3;++d) {
+        P[d]=a->center[d]+I*k[d]*v->inv2p;
+        Q[d]=v->center[d];
+        if (!c) Q[d]-=I*kp[d]*v->inv2q;
+        D[d]=P[d]-Q[d];
+    }
+}
+
 static Z primitive_argument(const Shell *a,const Shell *b,const Shell *c,
                             const PrimitiveData *v,const double *k,const double *kp,
                             Z P[3],Z Q[3],Z D[3],Z *phase) {
     Z t=0;
     *phase=v->phase;
+    primitive_centers(a,c,v,k,kp,P,Q,D);
     for (int d=0;d<3;++d) {
-        P[d]=a->center[d]+I*k[d]*v->inv2p;
         *phase+=I*k[d]*a->center[d]-k[d]*k[d]*(.5*v->inv2p);
-        Q[d]=v->center[d];
-        if (!c) {
-            Q[d]-=I*kp[d]*v->inv2q;
+        if (!c)
             *phase-=I*kp[d]*b->center[d]+kp[d]*kp[d]*(.5*v->inv2q);
-        }
-        D[d]=P[d]-Q[d]; t+=v->rho*D[d]*D[d];
+        t+=v->rho*D[d]*D[d];
     }
     return t;
 }
@@ -209,20 +216,22 @@ static Z primitive_argument(const Shell *a,const Shell *b,const Shell *c,
 static int primitive(GPWWorkspace *work,const Shell *a,const Shell *b,const Shell *c,
                      const PrimitiveData *v,const double *k,const double *kp,double coeff) {
     const int lc=c?c->l:0, n=(a->l+b->l+lc)/2+1;
-    Z P[3],Q[3],D[3],phase;
-    Z t=primitive_argument(a,b,c,v,k,kp,P,Q,D,&phase);
+    Z P[3],Q[3],D[3],phase,pref;
     Z local_s[10],local_w[10]; const Z *s=local_s,*weights=local_w;
     if (work->tile_lane>=0) {
         const GPWLowRule *rule=work->tile+(v-work->params)*GPW_LANES+work->tile_lane;
         s=rule->nodes; weights=rule->weights;
+        primitive_centers(a,c,v,k,kp,P,Q,D);
+        pref=rule->pref*coeff;
     } else {
+        Z t=primitive_argument(a,b,c,v,k,kp,P,Q,D,&phase);
         double residual;
         int status=gpw_rule(n,t,local_s,local_w,&residual);
         work->rules++;
         if (fabs(creal(t))>20||fabs(cimag(t))>12) work->special++;
         if (status) return status;
+        pref=v->pref*cexp(phase-fmin(creal(t),0.))*coeff;
     }
-    Z pref=v->pref*cexp(phase-fmin(creal(t),0.))*coeff;
     for (int root=0;root<n;++root) {
         Z va=(1-v->qfrac*s[root])*v->inv2p, vb=(1-v->pfrac*s[root])*v->inv2q;
         Z cross=s[root]*v->cross;
@@ -261,6 +270,15 @@ static int prepare_rules(GPWWorkspace *work,const Shell *a,const Shell *b,const 
         work->tile=tile; work->tile_capacity=size;
     }
     const int n=(a->l+b->l+(c?c->l:0))/2+1;
+    Z unit_phase[GPW_LANES];
+    for (int lane=0;lane<count;++lane) {
+        double angle=0.;
+        for (int d=0;d<3;++d) {
+            angle+=k[3*lane+d]*a->center[d];
+            if (!c) angle-=kp[3*lane+d]*b->center[d];
+        }
+        unit_phase[lane]=cos(angle)+I*sin(angle);
+    }
     for (int ic=0;ic<(c?c->np:1);++ic) {
         if (c && c->nc==1 && c->coeffs[ic]==0.) continue;
         for (int ib=0;ib<b->np;++ib) {
@@ -273,6 +291,8 @@ static int prepare_rules(GPWWorkspace *work,const Shell *a,const Shell *b,const 
                     Z P[3],Q[3],D[3],phase;
                     t[lane]=primitive_argument(a,b,c,work->params+index,k+3*lane,
                                                kp?kp+3*lane:NULL,P,Q,D,&phase);
+                    work->tile[index*GPW_LANES+lane].pref=
+                        work->params[index].pref*(exp(creal(phase)-fmin(creal(t[lane]),0.))*unit_phase[lane]);
                     work->rules++;
                     if (fabs(creal(t[lane]))>20||fabs(cimag(t[lane]))>12) work->special++;
                 }
@@ -342,12 +362,12 @@ static int shell_integral(GPWWorkspace *work,const Shell *a,const Shell *b,const
     return 0;
 }
 
-static Z *spherical(GPWWorkspace *work,const Shell **ss,int rank,size_t *dims) {
+static Z *spherical(GPWWorkspace *work,const Shell **ss,int rank,size_t *dims,int ncomp) {
     Z *src=work->a,*dst=work->b;
     for (int axis=0;axis<rank;++axis) {
         const Shell *s=ss[axis];
         if (s->l<2) continue;
-        size_t outer=1,inner=1;
+        size_t outer=ncomp,inner=1;
         for (int i=0;i<axis;++i) outer*=dims[i];
         for (int i=axis+1;i<rank;++i) inner*=dims[i];
         const int ns=2*s->l+1;
@@ -373,8 +393,11 @@ static int integral_batch(double *out,size_t capacity,int32_t kind,int32_t op,in
     const double *env,size_t nenv,const GPWOpt *opt,GPWWorkspace *work) {
     int status=environment(atoms,natm,basis,nbas,env,nenv);
     if (status) return status;
-    if ((kind<1||kind>3)||(kind==1&&(op<GPW_OVLP||op>GPW_NUC))||
+    if ((kind<1||kind>3)||(kind==1&&(op<GPW_OVLP||op>GPW_DIPOLE))||
         (cart!=0&&cart!=1)||!shls) return GPW_INPUT;
+    const int ncomp=kind==1&&op==GPW_DIPOLE?3:1;
+    if (ncomp==3) for (int d=0;d<3;++d)
+        if (!isfinite(env[PTR_COMMON_ORIG+d])) return GPW_INPUT;
     if (kind==1 && op==GPW_NUC) {
         status=gpw_nuclei_check(atoms,natm,env,nenv);
         if (status) return status;
@@ -388,7 +411,7 @@ static int integral_batch(double *out,size_t capacity,int32_t kind,int32_t op,in
         memcmp(opt->basis,basis,(size_t)nbas*8*sizeof(int32_t))||memcmp(opt->env,env,nenv*sizeof(double))))
         return GPW_STALE_OPT;
     Shell local[3]; const Shell *ss[3];
-    size_t block=1,cartblock=1;
+    size_t block=ncomp,cartblock=ncomp;
     for (int i=0;i<kind;++i) {
         if (shls[i]<0||shls[i]>=nbas) return GPW_INPUT;
         if (opt) ss[i]=opt->shells+shls[i];
@@ -461,7 +484,7 @@ static int integral_batch(double *out,size_t capacity,int32_t kind,int32_t op,in
                 if (local_status) break;
                 size_t dims[3];
                 for (int i=0;i<kind;++i) dims[i]=(size_t)ss[i]->nf*ss[i]->nc;
-                Z *value=cart?scratch->a:spherical(scratch,ss,kind,dims);
+                Z *value=cart?scratch->a:spherical(scratch,ss,kind,dims,ncomp);
                 for (size_t i=0;i<block;++i) {
                     if (!isfinite(creal(value[i]))||!isfinite(cimag(value[i]))) { local_status=GPW_NUMERIC; break; }
                     out[2*(ik*block+i)]=creal(value[i]); out[2*(ik*block+i)+1]=cimag(value[i]);
@@ -513,6 +536,8 @@ GP(gpw_int1e_kin_gp_cart,GPW_KIN,1)
 GP(gpw_int1e_kin_gp_sph,GPW_KIN,0)
 GP(gpw_int1e_nuc_gp_cart,GPW_NUC,1)
 GP(gpw_int1e_nuc_gp_sph,GPW_NUC,0)
+GP(gpw_int1e_dipole_gp_cart,GPW_DIPOLE,1)
+GP(gpw_int1e_dipole_gp_sph,GPW_DIPOLE,0)
 
 #define GPGG(name,cart) \
 int name(double *out,size_t capacity,const int32_t shls[3],const double k[3], \

@@ -5,9 +5,10 @@ All integral results are complex128. Passing one wavevector of shape (3,)
 returns no batch axis; passing (nk, 3) adds one leading batch axis. For
 gppg, that axis counts (k[i], kp[i]) pairs, not independent k and kp axes.
 The remaining axes always count Gaussian AOs: three for gpgg, two for gppg,
-and one for each one-electron integral.
+and one for each one-electron integral. Dipole adds an x/y/z component axis
+immediately before the AO axis: (3, nao) or (nk, 3, nao).
 
-Common keyword arguments for the five integral functions:
+Common keyword arguments for the integral functions:
     shls: Zero-based GTO shell indices, one per Gaussian AO axis. Omit to
         return all AO combinations.
     cart: Use Cartesian AOs if true, real spherical AOs if false; None uses
@@ -84,8 +85,11 @@ def library():
             if kind == 'gppg':
                 args.append(PDouble)
             signatures[f'gpw_int2e_{kind}_{rep}'] = (args + _env_args + [Handle, Handle], ct.c_int)
-    for op in ('ovlp', 'kin', 'nuc'):
+    for op in ('ovlp', 'kin', 'nuc', 'dipole'):
         for rep in ('cart', 'sph'):
+            # Older ABI-1 libraries remain usable for their existing operators.
+            if op == 'dipole' and not hasattr(lib, f'gpw_int1e_{op}_gp_{rep}'):
+                continue
             signatures[f'gpw_int1e_{op}_gp_{rep}'] = (
                 [PDouble, ct.c_size_t, PInt, PDouble] + _env_args + [Handle, Handle], ct.c_int)
     for name, (args, result) in signatures.items():
@@ -231,20 +235,22 @@ def _evaluate(kind, mol, k, kp=None, *, shls=None, cart=None,
               pw_norm='bare', volume=None, opt=None):
     """Evaluate one integral kind and assemble its AO shell blocks.
 
-    ``kind`` is ovlp, kin, nuc, gpgg, or gppg. For gppg, ``k`` and ``kp``
+    ``kind`` is ovlp, kin, nuc, dipole, gpgg, or gppg. For gppg, ``k`` and ``kp``
     must have identical shapes and are paired by position. ``shls`` selects
     one shell per AO axis; other options follow the module conventions.
 
     Returns:
         A complex128 AO array, with a leading batch axis only for batched
         wavevectors. The number of AO axes is one, three, or two for the
-        one-electron, gpgg, and gppg integrals, respectively.
+        one-electron, gpgg, and gppg integrals, respectively. Dipole has an
+        additional x/y/z axis immediately before its AO axis.
 
     Raises:
         ValueError: Invalid options, wavevectors, shells, or unsupported ECP.
         RuntimeError: The native GPW call fails or ``opt`` is stale.
     """
     rank = 3 if kind == 'gpgg' else 2 if kind == 'gppg' else 1
+    components = (3,) if kind == 'dipole' else ()
     waves, single = _waves(k)
     other = None
     if rank == 2:
@@ -281,12 +287,14 @@ def _evaluate(kind, mol, k, kp=None, *, shls=None, cart=None,
     scale = _normalization(waves, pw_norm, volume)
     if other is not None:
         scale *= _normalization(other, pw_norm, volume)
-    out = np.empty((len(waves), *shape), dtype=np.complex128)
+    out = np.empty((len(waves), *components, *shape), dtype=np.complex128)
     loc = np.concatenate(([0], np.cumsum(sizes)))
     lib = library()
+    if kind == 'dipole' and not hasattr(lib, 'gpw_int1e_dipole_gp_sph'):
+        raise NotImplementedError('dipole requires rebuilding libgpw with dipole support')
     handle = None if opt is None else opt._handle
     cart_sizes = [(int(l)+1)*(int(l)+2)//2*int(nc) for l, nc in bas[:, [1, 3]]]
-    capacity = 1
+    capacity = 3 if kind == 'dipole' else 1
     for size in ([cart_sizes[s] for s in shls] if shls is not None else
                  [max(cart_sizes, default=0)]*rank):
         capacity *= size
@@ -295,10 +303,10 @@ def _evaluate(kind, mol, k, kp=None, *, shls=None, cart=None,
     try:
         for shell in selected:
             indices = np.asarray(shell, dtype=np.int32)
-            block = np.empty((len(waves), *(int(sizes[s]) for s in shell)), dtype=np.complex128)
+            block = np.empty((len(waves), *components, *(int(sizes[s]) for s in shell)), dtype=np.complex128)
             common = (double_pointer(block), block.size)
             if rank == 1:
-                status = lib.gpw_int1e_batch(*common, {'ovlp': 1, 'kin': 2, 'nuc': 3}[kind], int(cart),
+                status = lib.gpw_int1e_batch(*common, {'ovlp': 1, 'kin': 2, 'nuc': 3, 'dipole': 4}[kind], int(cart),
                     int_pointer(indices), double_pointer(waves), len(waves), *args, handle, workspace)
             else:
                 status = lib.gpw_int2e_batch(*common, rank, int(cart), int_pointer(indices),
@@ -306,7 +314,7 @@ def _evaluate(kind, mol, k, kp=None, *, shls=None, cart=None,
             check(status, f'{kind}, shls={shell}')
             if shls is None:
                 slices = tuple(slice(loc[s], loc[s+1]) for s in shell)
-                out[(slice(None),) + slices] = block
+                out[(slice(None),)*(1+len(components)) + slices] = block
                 if rank == 3 and shell[1] != shell[2]:
                     # Real GTO products commute on electron 2: no conjugation.
                     out[:, slices[0], slices[2], slices[1]] = block.swapaxes(-1, -2)
@@ -314,7 +322,7 @@ def _evaluate(kind, mol, k, kp=None, *, shls=None, cart=None,
                 out[...] = block
     finally:
         lib.gpw_workspace_destroy(workspace)
-    out *= scale.reshape((-1,) + (1,)*rank)
+    out *= scale.reshape((-1,) + (1,)*(rank+len(components)))
     return out[0] if single else out
 
 
@@ -367,6 +375,34 @@ def nuc(mol, k, **kwargs):
         ValueError: The molecule contains ECP shells.
     """
     return _evaluate('nuc', mol, k, **kwargs)
+
+
+def dipole(mol, k, **kwargs):
+    """Compute the AO–PW position integral ``<G_a|(r-O)|P_k>``.
+
+    The operator has components x, y, z, in that order, and does not include
+    the electron charge (-1). The origin O is PySCF's common origin, in
+    bohr (zero by default); use ``mol.with_common_orig(origin)`` to change
+    it. Create ``opt`` inside that context because it snapshots ``mol._env``.
+
+    Args:
+        mol: PySCF Mole containing the Gaussian AO basis and common origin.
+        k: One real wavevector ``(3,)`` or a batch ``(nk, 3)`` in bohr^-1.
+        **kwargs: Common ``shls``, ``cart``, ``pw_norm``, ``volume``, and
+            ``opt`` options documented at module level.
+
+    Returns:
+        Complex128 array ``(3, nao)`` for a single ``(3,)`` input, or
+        ``(nk, 3, nao)`` for ``(nk, 3)`` input, including ``nk=1`` or 0.
+        With ``shls=(a,)``, ``nao`` is the AO count of shell a.
+        For bare plane waves, D_d = -i*d(ovlp)/dk_d - O_d*ovlp.
+
+    Raises:
+        NotImplementedError: The loaded libgpw predates dipole support.
+        RuntimeError: The native call fails or ``opt`` is stale.
+        ValueError: An input or common keyword option is invalid.
+    """
+    return _evaluate('dipole', mol, k, **kwargs)
 
 
 def gpgg(mol, k, **kwargs):
@@ -451,6 +487,15 @@ def nuc_by_shell(mol, shls, k, **kwargs):
     for ``mol``, ``k``, and the remaining keyword options.
     """
     return nuc(mol, k, shls=shls, **kwargs)
+
+
+def dipole_by_shell(mol, shls, k, **kwargs):
+    """Compute ``<G_a|(r-O)|P_k>`` for the one GTO shell in ``shls``.
+
+    Returns ``(3, n_a)`` or ``(nk, 3, n_a)`` with x/y/z components;
+    see :func:`dipole` for the origin, sign and remaining options.
+    """
+    return dipole(mol, k, shls=shls, **kwargs)
 
 
 def gpgg_by_shell(mol, shls, k, **kwargs):

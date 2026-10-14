@@ -10,6 +10,7 @@ with gpw.prepare(mol) as opt:
     s = gpw.ovlp(mol, k, opt=opt)
     t = gpw.kin(mol, k, opt=opt)
     v = gpw.nuc(mol, k, opt=opt)
+    d = gpw.dipole(mol, k, opt=opt)     # (nk, 3, nao): x/y/z, origin zero, no -e
 
     # Chemists' (G_a P_k | G_b G_c), all AO indices, batched over k.
     gpgg = gpw.gpgg(mol, k, opt=opt)          # (nk, nao, nao, nao)
@@ -26,7 +27,9 @@ with gpw.prepare(mol) as opt:
     assert np.allclose(gppg_shell, gppg[1, a, b])
     assert np.allclose(t, .5*(k*k).sum(axis=1)[:, None]*s)
     assert np.array_equal(s[:, :1], gpw.ovlp_by_shell(mol, (0,), k, opt=opt))
+    np.testing.assert_allclose(d[1, :, a], gpw.dipole_by_shell(mol, (0,), k[1], opt=opt))
     print('S/T/V:', s.shape, t.shape, v.shape)
+    print('Dipole:', d.shape)
     print('(G P|G G):', gpgg.shape, '(G P|P G):', gppg.shape)
     print('Single-wavevector shell blocks:', gpgg_shell.shape, gppg_shell.shape)
     print('(G_0 P_k[1]|G_1 G_2):', gpgg_shell[0, 0, 0])

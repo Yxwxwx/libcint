@@ -15,6 +15,23 @@ if(GPW_WITH_OPENMP)
     message(STATUS "OpenMP C unavailable; building serial GPW")
   endif()
 endif()
+if(OpenMP_C_FOUND AND GPW_WITH_OPENMP AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+  include(CheckCSourceCompiles)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_LIBRARIES m)
+  check_c_source_compiles("
+    typedef double V __attribute__((vector_size(16)));
+    extern V _ZGVbN2v_exp(V), _ZGVbN2v_cos(V), _ZGVbN2v_sin(V);
+    int main(void) { V x={0.1,0.2};
+      x=_ZGVbN2v_exp(x)+_ZGVbN2v_cos(x)+_ZGVbN2v_sin(x); return x[0]==0; }
+    " GPW_HAVE_SIMD_MATH)
+  cmake_pop_check_state()
+  if(GPW_HAVE_SIMD_MATH)
+    target_compile_definitions(gpw PRIVATE GPW_SIMD_MATH)
+    set_source_files_properties(gpw_rys.c PROPERTIES COMPILE_FLAGS "-fno-math-errno")
+  endif()
+endif()
 target_compile_definitions(gpw PRIVATE KEEP_GOING)
 if(QUADMATH_FOUND)
   target_link_libraries(gpw PRIVATE quadmath)
@@ -40,6 +57,11 @@ if(ENABLE_TEST)
       ${PROJECT_SOURCE_DIR}/testsuite/gpw/test_int1e.py --library $<TARGET_FILE:gpw>
       --report ${PROJECT_BINARY_DIR}/gpw_int1e_validation.json)
     set_tests_properties(gpw_int1e PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+    add_test(NAME gpw_dipole COMMAND ${PYTHON_EXECUTABLE}
+      ${PROJECT_SOURCE_DIR}/testsuite/gpw/test_dipole.py --library $<TARGET_FILE:gpw>
+      --report ${PROJECT_BINARY_DIR}/gpw_dipole_validation.json)
+    set_tests_properties(gpw_dipole PROPERTIES ENVIRONMENT
+      "PYTHONDONTWRITEBYTECODE=1;OMP_NUM_THREADS=4;OPENBLAS_NUM_THREADS=1")
   else()
     message(STATUS "GPW Python numerical test requires numpy, pyscf and mpmath; C smoke is available")
   endif()

@@ -18,7 +18,7 @@ enum { GPW_SUCCESS=0, GPW_SCREENED=1, GPW_INPUT=-1, GPW_RANGE=-2,
        GPW_NUMERIC=-3, GPW_MEMORY=-4, GPW_WORKSPACE=-5, GPW_ABI=-6,
        GPW_STALE_OPT=-7 };
 enum { GPW_GPPG=2, GPW_GPGG=3 };
-enum { GPW_OVLP=1, GPW_KIN=2, GPW_NUC=3 };
+enum { GPW_OVLP=1, GPW_KIN=2, GPW_NUC=3, GPW_DIPOLE=4 };
 
 GPW_API int gpw_abi_version(void);
 GPW_API int gpw_integer_bytes(void);
@@ -27,7 +27,8 @@ GPW_API const char *gpw_error_string(int status);
 GPW_API int gpw_opt_create(GPWOpt **opt, const int32_t *atm, int32_t natm,
     const int32_t *bas, int32_t nbas, const double *env, size_t nenv);
 GPW_API void gpw_opt_destroy(GPWOpt *opt);
-/* Capacity is in complex Cartesian shell elements; each call needs three buffers.
+/* Capacity is in complex Cartesian shell elements, including operator components
+ * (three for dipole); each workspace allocates three buffers of that capacity.
  * A workspace belongs to one concurrent caller; an opt is immutable/shareable.
  * Parallel batches allocate private scratch per worker; workspace_bytes reports
  * only the caller's persistent allocation, not temporary worker allocations. */
@@ -67,7 +68,21 @@ GPW_API int gpw_int1e_nuc_gp_sph(double *out_ri, size_t out_ncomplex,
     const int32_t *atm, int32_t natm, const int32_t *bas, int32_t nbas,
     const double *env, size_t nenv, const GPWOpt *opt, GPWWorkspace *work);
 
-/* k is flat (count,3); output is (count,nAO_shell). op is GPW_OVLP/KIN/NUC.
+/* <G_a|(r-O)_d|exp(+i k.r)>, d=x,y,z; no electron charge factor.
+ * O is env[PTR_COMMON_ORIG:PTR_COMMON_ORIG+3], in bohr.
+ * Output is (3,nAO_shell), C order; workspace capacity needs 3*ncart_shell.
+ * Set the origin before creating opt, since opt snapshots the whole env. */
+GPW_API int gpw_int1e_dipole_gp_cart(double *out_ri, size_t out_ncomplex,
+    const int32_t shls[1], const double k[3],
+    const int32_t *atm, int32_t natm, const int32_t *bas, int32_t nbas,
+    const double *env, size_t nenv, const GPWOpt *opt, GPWWorkspace *work);
+GPW_API int gpw_int1e_dipole_gp_sph(double *out_ri, size_t out_ncomplex,
+    const int32_t shls[1], const double k[3],
+    const int32_t *atm, int32_t natm, const int32_t *bas, int32_t nbas,
+    const double *env, size_t nenv, const GPWOpt *opt, GPWWorkspace *work);
+
+/* k is flat (count,3); output is (count,nAO_shell) for GPW_OVLP/KIN/NUC,
+ * or (count,3,nAO_shell) for GPW_DIPOLE, including count=1.
  * The same capacity, opt, workspace and failure rules as int2e_batch apply. */
 GPW_API int gpw_int1e_batch(double *out_ri, size_t out_ncomplex,
     int32_t op, int32_t cart, const int32_t shls[1], const double *k, size_t count,
